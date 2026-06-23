@@ -1,0 +1,56 @@
+{
+  "name": "@genspark/genteam",
+  "version": "0.2.2",
+  "description": "OpenClaw channel plugin connecting a self-hosted OpenClaw gateway to GenTeam as an Agent runtime",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist/**",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts --format=esm --platform=node --outfile=dist/index.js",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "typebox": "^1.3.0",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.9"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "channel": {
+      "id": "genteam",
+      "label": "GenTeam",
+      "selectionLabel": "GenTeam",
+      "docsPath": "/channels/genteam",
+      "docsLabel": "genteam",
+      "blurb": "Connect this gateway to GenTeam as an Agent runtime.",
+      "order": 70
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.9"
+    },
+    "build": {
+      "openclawVersion": "2026.6.9"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.22.4",
+    "typebox": "^1.3.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "genteam",
+  "name": "GenTeam",
+  "description": "OpenClaw channel plugin connecting a self-hosted gateway to GenTeam as an Agent runtime.",
+  "activation": {
+    "onStartup": true
+  },
+  "channels": ["genteam"],
+  "contracts": {
+    "tools": [
+      "de_server_info",
+      "de_channel_members",
+      "de_channel_files",
+      "de_message_read",
+      "de_thread_read",
+      "de_thread_unfollow",
+      "de_attachment_list",
+      "de_attachment_view",
+      "de_task_list",
+      "de_task_claim",
+      "de_task_unclaim",
+      "de_task_update",
+      "de_task_read",
+      "de_reaction_add",
+      "de_reaction_remove",
+      "de_message_send",
+      "de_message_send_attachment"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "genteam": {
+      "label": "GenTeam",
+      "description": "Connect this gateway to GenTeam as an Agent runtime.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Named accounts under `accounts` (the runtime reads `channels.genteam.accounts.<id>`; install.sh writes `accounts.default`). Mirrors OpenClaw's catchall multi-account channel shape.",
+        "properties": {
+          "defaultAccount": {
+            "type": "string",
+            "description": "Account id to use when none is specified (default: \"default\")."
+          },
+          "accounts": {
+            "type": "object",
+            "description": "Named GenTeam connections (the runtime reads accounts.<id>).",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["endpoint", "channelId", "appToken", "botToken"],
+              "properties": {
+                "endpoint": { "type": "string", "description": "GenTeam backend base URL." },
+                "channelId": { "type": "string", "description": "Non-secret routing id (occ_…)." },
+                "appToken": { "type": "string", "description": "App/connection token (oca_…)." },
+                "botToken": { "type": "string", "description": "Bot secret (ocb_…)." }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
