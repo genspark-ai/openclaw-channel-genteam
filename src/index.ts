@@ -39,8 +39,8 @@
  *   (2) channel WS:     {ws_base}/api/digital-employee/openclaw/channel/ws?token=<ws_token>
  *   (3) write-back:     POST {endpoint}/api/digital-employee/agent_tools/<verb>
  */
-import { readFileSync } from 'fs'
-import { resolve, dirname } from 'path'
+import { readFileSync, realpathSync } from 'fs'
+import { resolve, dirname, isAbsolute, relative } from 'path'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
@@ -122,6 +122,7 @@ interface GenteamAccountConfig {
   channelId: string
   appToken: string
   botToken: string
+  attachmentRoots: string[]
 }
 
 interface AuthResult {
@@ -211,6 +212,42 @@ const connectionsByAccount = new Map<string, ConnectionState>()
 // Config resolution
 // ---------------------------------------------------------------------------
 
+function normalizeAttachmentRoots(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const roots = value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => resolve(item))
+  return roots
+}
+
+function isPathInsideRoot(filePath: string, root: string): boolean {
+  const rel = relative(root, filePath)
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
+}
+
+function normalizeAllowedAttachmentPath(rawPath: string, roots: string[]): string | undefined {
+  if (!rawPath || rawPath.includes('\0') || !isAbsolute(rawPath) || roots.length === 0) return undefined
+  let resolvedPath: string
+  try {
+    resolvedPath = realpathSync(rawPath)
+  } catch {
+    return undefined
+  }
+  for (const root of roots) {
+    try {
+      const resolvedRoot = realpathSync(root)
+      if (isPathInsideRoot(resolvedPath, resolvedRoot)) return resolvedPath
+    } catch {
+      // Missing/misconfigured roots do not grant access.
+    }
+  }
+  return undefined
+}
+
+function formatAttachmentRoots(roots: string[]): string {
+  return roots.length > 0 ? roots.join(', ') : 'none configured'
+}
+
 function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConfig {
   const id = accountId ?? 'default'
   const acc = cfg?.channels?.genteam?.accounts?.[id] ?? {}
@@ -218,6 +255,7 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
   const channelId = String(acc.channelId ?? '')
   const appToken = String(acc.appToken ?? '')
   const botToken = String(acc.botToken ?? '')
+  const attachmentRoots = normalizeAttachmentRoots(acc.attachmentRoots)
 
   const missing: string[] = []
   if (!endpoint) missing.push('endpoint')
@@ -230,7 +268,7 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
     )
   }
 
-  return { accountId: id, endpoint, channelId, appToken, botToken }
+  return { accountId: id, endpoint, channelId, appToken, botToken, attachmentRoots }
 }
 
 function listAccountIds(cfg: any): string[] {
@@ -693,7 +731,7 @@ function buildGenteamTools(toolCtx: any): any[] {
     name: 'de_message_send_attachment',
     label: 'de_message_send_attachment',
     description:
-      'Send one or more local files as a GenTeam message attachment (up to 10, 99 MiB each). `paths` are absolute paths in your workspace. Optional `content` is the caption. `target` defaults to the current conversation.',
+      'Send one or more local files as a GenTeam message attachment (up to 10, 99 MiB each). `paths` must be absolute paths under configured attachment roots; if no roots are configured, local uploads are disabled. Optional `content` is the caption. `target` defaults to the current conversation.',
     parameters: Type.Object({
       paths: Type.Array(Type.String(), { minItems: 1, maxItems: DE_ATTACHMENT_MAX_COUNT, description: 'Local file paths to upload.' }),
       content: Type.Optional(Type.String({ description: 'Optional caption.' })),
@@ -723,12 +761,19 @@ function buildGenteamTools(toolCtx: any): any[] {
       if (params?.parent_message) form.set('parent_message', String(params.parent_message))
       try {
         for (const p of paths) {
-          const buf = readFileSync(p)
-          if (buf.length === 0) return toolText(`error: attachment is empty: ${p}`, true)
-          if (buf.length > DE_ATTACHMENT_MAX_BYTES) {
-            return toolText(`error: attachment exceeds the 99 MiB cap: ${p}`, true)
+          const safePath = normalizeAllowedAttachmentPath(String(p), state.cfg.attachmentRoots)
+          if (!safePath) {
+            return toolText(
+              `error: attachment path is outside the allowed roots (${formatAttachmentRoots(state.cfg.attachmentRoots)}): ${p}`,
+              true,
+            )
           }
-          const fname = p.split('/').pop() || 'file'
+          const buf = readFileSync(safePath)
+          if (buf.length === 0) return toolText(`error: attachment is empty: ${safePath}`, true)
+          if (buf.length > DE_ATTACHMENT_MAX_BYTES) {
+            return toolText(`error: attachment exceeds the 99 MiB cap: ${safePath}`, true)
+          }
+          const fname = safePath.split('/').pop() || 'file'
           form.append('file', new Blob([new Uint8Array(buf)]), fname)
         }
       } catch (e: any) {
@@ -1417,11 +1462,11 @@ const genteamPlugin = {
   id: 'genteam' as const,
   meta,
   capabilities: {
-    chatTypes: ['direct'] as const,
+    chatTypes: ['direct', 'group'] as const,
     polls: false,
-    threads: false,
-    media: false,
-    reactions: false,
+    threads: true,
+    media: true,
+    reactions: true,
     edit: false,
     reply: true,
   },

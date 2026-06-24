@@ -13,6 +13,9 @@
 // Run with `npm test` (node --import tsx --test).
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, test } from 'node:test'
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 import {
   buildGenteamTools,
@@ -43,6 +46,7 @@ function fakeConnection(overrides: Partial<ConnectionState> = {}): ConnectionSta
       channelId: 'occ_test',
       appToken: 'oca_test',
       botToken: 'ocb_test',
+      attachmentRoots: [process.cwd()],
     },
     auth: {
       wsToken: 'wt',
@@ -228,6 +232,82 @@ test('attachment-view forces metadata_only (a model tool never streams bytes)', 
     assert.equal(calls[0].body.attachment_ref, 'm1:0')
   } finally {
     restore()
+  }
+})
+
+test('message-send-attachment only reads files under configured attachment roots', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-root-'))
+  const outside = mkdtempSync(join(tmpdir(), 'genteam-attach-outside-'))
+  const allowedPath = join(root, 'ok.txt')
+  const blockedPath = join(outside, 'secret.txt')
+  const symlinkPath = join(root, 'secret-link.txt')
+  writeFileSync(allowedPath, 'hello')
+  writeFileSync(blockedPath, 'secret')
+  symlinkSync(blockedPath, symlinkPath)
+
+  const state = fakeConnection({
+    cfg: {
+      ...fakeConnection().cfg,
+      attachmentRoots: [root],
+    },
+  })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch(() => ({ json: { status: 0, comet_message_id: 'm1' } }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+
+    const blocked = await sendAttachment.execute('c', { paths: [blockedPath] }, undefined)
+    assert.equal(blocked.isError, true)
+    assert.match(blocked.content[0].text, /outside the allowed roots/)
+    assert.equal(calls.length, 0, 'blocked paths are rejected before any upload request')
+
+    const symlinked = await sendAttachment.execute('c', { paths: [symlinkPath] }, undefined)
+    assert.equal(symlinked.isError, true)
+    assert.match(symlinked.content[0].text, /outside the allowed roots/)
+    assert.equal(calls.length, 0, 'symlink escapes are rejected before any upload request')
+
+    const allowed = await sendAttachment.execute('c', { paths: [allowedPath] }, undefined)
+    assert.equal(allowed.isError, undefined)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].url, 'https://example.test/api/digital-employee/agent_tools/message-send-attachment')
+    assert.equal(turn.sentCount, 1)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('message-send-attachment is disabled when no attachment roots are configured', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-disabled-'))
+  const path = join(root, 'file.txt')
+  writeFileSync(path, 'hello')
+
+  const state = fakeConnection({
+    cfg: {
+      ...fakeConnection().cfg,
+      attachmentRoots: [],
+    },
+  })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch(() => ({ json: { status: 0 } }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+    const res = await sendAttachment.execute('c', { paths: [path] }, undefined)
+    assert.equal(res.isError, true)
+    assert.match(res.content[0].text, /none configured/)
+    assert.equal(calls.length, 0)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
   }
 })
 

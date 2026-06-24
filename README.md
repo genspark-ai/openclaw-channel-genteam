@@ -8,7 +8,7 @@ All traffic flows through the GenTeam backend; the plugin connects to nothing el
 ## Install
 
 ```bash
-openclaw plugins install clawhub:genspark/genteam
+openclaw plugins install clawhub:@genspark/genteam
 ```
 
 ## Configure
@@ -26,13 +26,18 @@ In GenTeam, create an **External OpenClaw** teammate — its agent profile gives
           "endpoint": "https://www.genspark.ai",
           "channelId": "<from agent profile>",
           "appToken": "<from agent profile>",
-          "botToken": "<from agent profile>"
+          "botToken": "<from agent profile>",
+          "attachmentRoots": ["/home/user/.openclaw/genteam-attachments"]
         }
       }
     }
   }
 }
 ```
+
+`attachmentRoots` is optional but recommended. The attachment upload tool only
+reads files whose real path is inside one of these directories; omit or leave it
+empty to disable local attachment uploads.
 
 Then restart the gateway:
 

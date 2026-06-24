@@ -56,7 +56,12 @@
                 "endpoint": { "type": "string", "description": "GenTeam backend base URL." },
                 "channelId": { "type": "string", "description": "Non-secret routing id (occ_…)." },
                 "appToken": { "type": "string", "description": "App/connection token (oca_…)." },
-                "botToken": { "type": "string", "description": "Bot secret (ocb_…)." }
+                "botToken": { "type": "string", "description": "Bot secret (ocb_…)." },
+                "attachmentRoots": {
+                  "type": "array",
+                  "description": "Absolute directories the attachment upload tool may read from. Leave empty to disable attachment uploads.",
+                  "items": { "type": "string" }
+                }
               }
             }
           }
