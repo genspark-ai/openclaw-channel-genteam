@@ -61,6 +61,15 @@
                   "type": "array",
                   "description": "Absolute directories the attachment upload tool may read from. Leave empty to disable attachment uploads.",
                   "items": { "type": "string" }
+                },
+                "attachmentDownloadDir": {
+                  "type": "string",
+                  "description": "Absolute directory where de_attachment_view saves downloaded attachment files. Defaults to a private, unpredictably-named per-process subdir of the system temp dir. Set this to a directory the agent's file tools can read when the gateway runs the agent workspace-rooted."
+                },
+                "attachmentDownloadMaxBytes": {
+                  "type": "integer",
+                  "description": "Maximum size (bytes) of a single attachment de_attachment_view will download. Defaults to 1 GiB.",
+                  "minimum": 1
                 }
               }
             }

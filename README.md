@@ -39,6 +39,16 @@ In GenTeam, create an **External OpenClaw** teammate — its agent profile gives
 reads files whose real path is inside one of these directories; omit or leave it
 empty to disable local attachment uploads.
 
+`attachmentDownloadDir` is optional. When the agent reads an inbound attachment,
+`de_attachment_view` downloads the file to this directory and returns its local
+path so the agent can open the contents (for example, Read an image). It
+defaults to a private, unpredictably-named per-process subdirectory of the
+system temp dir (created mode `0700`, with each file written `0600`); set it to
+a directory your agent's file tools can read if the gateway runs the agent
+workspace-rooted. The download is streamed to disk and capped at 1 GiB (override
+per account with `attachmentDownloadMaxBytes`), so a large attachment never
+buffers in the gateway's memory.
+
 Then restart the gateway:
 
 ```bash

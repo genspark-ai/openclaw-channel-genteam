@@ -7,7 +7,7 @@
 // module load throws. Two real regressions this guards:
 //
 //   1. The shared upload core is imported from a sibling source dir
-//      (../../shared/attachment-upload). esbuild `--bundle` must INLINE it; the
+//      (../shared/attachment-upload). esbuild `--bundle` must INLINE it; the
 //      old non-bundled command emitted a literal `from "../../shared/..."` that
 //      fails at runtime load — and no source-level (tsx) test catches it,
 //      because tsx resolves the .ts directly.

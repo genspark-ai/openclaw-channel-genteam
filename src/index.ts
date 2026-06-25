@@ -39,8 +39,13 @@
  *   (2) channel WS:     {ws_base}/api/digital-employee/openclaw/channel/ws?token=<ws_token>
  *   (3) write-back:     POST {endpoint}/api/digital-employee/agent_tools/<verb>
  */
-import { readFileSync, realpathSync } from 'fs'
-import { resolve, dirname, isAbsolute, relative } from 'path'
+import { readFileSync, realpathSync, createWriteStream, mkdirSync, lstatSync, mkdtempSync } from 'fs'
+import { rm } from 'fs/promises'
+import { resolve, dirname, isAbsolute, relative, join } from 'path'
+import { tmpdir } from 'os'
+import { Readable, Transform } from 'stream'
+import { pipeline } from 'stream/promises'
+import { createHash, randomBytes } from 'crypto'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
@@ -66,6 +71,7 @@ import {
   uploadAttachmentsViaSession,
   combineSignals,
   GENTEAM_ATTACHMENT_MAX_COUNT,
+  GENTEAM_DIRECT_UPLOAD_MAX_BYTES,
   type AgentToolPost,
 } from '../shared/attachment-upload.ts'
 
@@ -140,6 +146,14 @@ const AGENT_TOOLS_PREFIX = '/api/digital-employee/agent_tools'
 const TOOL_HTTP_TIMEOUT_MS = 30_000
 const TOOL_ATTACHMENT_HTTP_TIMEOUT_MS = 300_000
 
+// Default per-attachment cap for `de_attachment_view` byte materialization.
+// Mirrors the 1 GiB upload ceiling so a download never exceeds what GenTeam
+// itself accepts; an operator can lower it per-account via
+// `attachmentDownloadMaxBytes`. The body is streamed straight to disk (never
+// buffered), so this guards disk abuse and a lying ``X-DE-Attachment-Size``
+// header — not gateway memory.
+const GENTEAM_ATTACHMENT_DOWNLOAD_MAX_BYTES = GENTEAM_DIRECT_UPLOAD_MAX_BYTES
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -151,6 +165,14 @@ interface GenteamAccountConfig {
   appToken: string
   botToken: string
   attachmentRoots: string[]
+  // Where `de_attachment_view` writes downloaded attachment bytes. Optional;
+  // defaults to a private, unpredictably-named per-process subdir of the system
+  // temp dir. Set it to a directory the agent's own file tools can read when the
+  // gateway runs the agent workspace-rooted.
+  attachmentDownloadDir?: string
+  // Optional per-attachment download cap (bytes); defaults to 1 GiB. Lets an
+  // operator restrict how large a single materialized download may be.
+  attachmentDownloadMaxBytes?: number
 }
 
 interface AuthResult {
@@ -276,6 +298,34 @@ function formatAttachmentRoots(roots: string[]): string {
   return roots.length > 0 ? roots.join(', ') : 'none configured'
 }
 
+// Collapse a backend-supplied attachment filename to a safe basename so a
+// hostile ``X-DE-Attachment-Filename`` (e.g. ``../../etc/passwd`` or one with
+// path separators / NUL) can never escape the download dir. Mirrors the
+// sandbox CLI shim's ``tr -c 'A-Za-z0-9._-' '_'`` + basename behaviour, and
+// guards the pure-dot cases so we never target ``.`` / ``..``. Length-bounded
+// so a pathological 64 KiB filename cannot blow the path limit.
+function sanitizeAttachmentBasename(name: string): string {
+  const base = (name || '').split(/[/\\]/).pop() || ''
+  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, '_')
+  if (!cleaned || cleaned === '.' || cleaned === '..') return 'file'
+  return cleaned.slice(0, 200)
+}
+
+// Where downloaded attachment bytes land. An explicit configured dir wins;
+// otherwise we lazily create ONE private, unpredictably-named per-process dir
+// under the OS temp dir. `mkdtempSync` creates it mode 0700, and the random
+// suffix defeats a co-tenant pre-planting a symlink at a guessable
+// `/tmp/genteam-attachments` (the prior fixed name made that a real attack on a
+// shared host). Cached so repeated downloads reuse the same private dir.
+let _defaultDownloadDir: string | undefined
+function resolveAttachmentDownloadDir(cfg: GenteamAccountConfig): string {
+  if (cfg.attachmentDownloadDir) return cfg.attachmentDownloadDir
+  if (!_defaultDownloadDir) {
+    _defaultDownloadDir = mkdtempSync(join(tmpdir(), 'genteam-attachments-'))
+  }
+  return _defaultDownloadDir
+}
+
 function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConfig {
   const id = accountId ?? 'default'
   const acc = cfg?.channels?.genteam?.accounts?.[id] ?? {}
@@ -284,6 +334,16 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
   const appToken = String(acc.appToken ?? '')
   const botToken = String(acc.botToken ?? '')
   const attachmentRoots = normalizeAttachmentRoots(acc.attachmentRoots)
+  const attachmentDownloadDir =
+    typeof acc.attachmentDownloadDir === 'string' && acc.attachmentDownloadDir.trim().length > 0
+      ? resolve(acc.attachmentDownloadDir)
+      : undefined
+  const attachmentDownloadMaxBytes =
+    typeof acc.attachmentDownloadMaxBytes === 'number' &&
+    Number.isFinite(acc.attachmentDownloadMaxBytes) &&
+    acc.attachmentDownloadMaxBytes > 0
+      ? Math.floor(acc.attachmentDownloadMaxBytes)
+      : undefined
 
   const missing: string[] = []
   if (!endpoint) missing.push('endpoint')
@@ -296,7 +356,16 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
     )
   }
 
-  return { accountId: id, endpoint, channelId, appToken, botToken, attachmentRoots }
+  return {
+    accountId: id,
+    endpoint,
+    channelId,
+    appToken,
+    botToken,
+    attachmentRoots,
+    attachmentDownloadDir,
+    attachmentDownloadMaxBytes,
+  }
 }
 
 function listAccountIds(cfg: any): string[] {
@@ -399,6 +468,166 @@ async function callAgentTool(
   // backend-side rejection (permission, idempotency, validation).
   const envelopeOk = json == null || json.status === undefined || json.status === 0
   return { status: res.status, ok: res.ok && envelopeOk, json, text }
+}
+
+// Result of materializing an inbound attachment onto the gateway filesystem.
+// `source` is a nested {attachment_ref, source} object to match the sandbox /
+// local `de attachment-view` result shape exactly (cross-runtime parity).
+interface MaterializedAttachment {
+  local_path: string
+  filename: string
+  mime_type: string
+  size: number
+  sha256: string
+  source: { attachment_ref: string; source: string }
+}
+
+type DownloadResult =
+  | { ok: true; data: MaterializedAttachment }
+  | { ok: false; status: number; detail: string; json: any }
+
+// Download an attachment's raw bytes (backend binary mode, `metadata_only:false`)
+// and STREAM them straight to a file under the account's download dir — the body
+// is never buffered in gateway memory, so a large attachment cannot OOM the
+// gateway. The backend has already enforced agent-token auth + channel
+// membership + ref/chat validation and stripped the secure-media URL/token; the
+// plugin only ever sees the bytes and a small set of safe `X-DE-Attachment-*`
+// headers. On top of that we: cap the size (the header can lie or be absent),
+// reject a symlinked download dir, write to an UNPREDICTABLE filename with
+// O_EXCL + mode 0600 (so a co-tenant cannot pre-plant a symlink at the target to
+// redirect/leak the bytes), and clean up any partial on failure.
+async function downloadAttachmentToDisk(
+  state: ConnectionState,
+  body: Record<string, any>,
+  signal: AbortSignal | undefined,
+): Promise<DownloadResult> {
+  const { cfg, auth } = state
+  const maxBytes = cfg.attachmentDownloadMaxBytes ?? GENTEAM_ATTACHMENT_DOWNLOAD_MAX_BYTES
+  const url = `${cfg.endpoint}${AGENT_TOOLS_PREFIX}/attachment-view`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${auth.agentToken}`,
+    },
+    // Force binary mode regardless of any caller-supplied flag.
+    body: JSON.stringify({ ...body, verb: 'attachment-view', metadata_only: false }),
+    signal: combineSignals(signal, TOOL_ATTACHMENT_HTTP_TIMEOUT_MS),
+  })
+  if (!res.ok || res.status >= 400) {
+    const text = await res.text().catch(() => '')
+    let json: any = null
+    try {
+      json = JSON.parse(text)
+    } catch {
+      /* non-JSON error body */
+    }
+    return { ok: false, status: res.status, detail: text.slice(0, 600), json }
+  }
+  if (!res.body) {
+    return { ok: false, status: res.status, detail: 'empty attachment response body', json: null }
+  }
+
+  const h = res.headers
+  const filename = h.get('x-de-attachment-filename') || 'file'
+  const mime = h.get('x-de-attachment-mime') || ''
+  const sizeHdr = h.get('x-de-attachment-size') || ''
+  const declaredSize = /^\d+$/.test(sizeHdr) ? Number(sizeHdr) : null
+  const refHeader = h.get('x-de-attachment-ref') || String(body.attachment_ref ?? '')
+  const source = h.get('x-de-attachment-source') || 'secure_media'
+
+  // Reject an oversized attachment up front when the backend declared a size,
+  // so we don't even open the file. (The mid-stream guard below is the real
+  // enforcement — the header is advisory and can lie.) Cancel the body so an
+  // undrained response stream doesn't pin the connection (resource leak).
+  if (declaredSize != null && declaredSize > maxBytes) {
+    await res.body.cancel().catch(() => {})
+    return {
+      ok: false,
+      status: 413,
+      detail: `attachment is too large to download (${declaredSize} bytes > ${maxBytes} max)`,
+      json: null,
+    }
+  }
+
+  const dir = resolveAttachmentDownloadDir(cfg)
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+  } catch (e: any) {
+    // Cancel the still-open body so a bailout before streaming doesn't pin the
+    // connection (same leak class as the oversized early-return above).
+    await res.body.cancel().catch(() => {})
+    return { ok: false, status: 0, detail: `cannot create download dir ${dir}: ${String(e?.message ?? e)}`, json: null }
+  }
+  // Refuse to write into a symlinked dir — a co-tenant who pre-planted the
+  // (configured) dir as a symlink would otherwise redirect every download.
+  try {
+    if (lstatSync(dir).isSymbolicLink()) {
+      await res.body.cancel().catch(() => {})
+      return { ok: false, status: 0, detail: `download dir is a symlink, refusing: ${dir}`, json: null }
+    }
+  } catch {
+    /* stat race — fall through; the O_EXCL write below is the real guard */
+  }
+  const safeName = sanitizeAttachmentBasename(filename)
+  const refPart = (refHeader || 'ref').replace(/[^A-Za-z0-9._-]/g, '_')
+  // A random component makes the target unpredictable (defeats a pre-planted
+  // symlink at a guessable name) AND prevents same-ref re-downloads from
+  // overwriting a file the agent may still be reading.
+  const finalPath = join(dir, `${refPart}_${randomBytes(6).toString('hex')}_${safeName}`)
+
+  const hasher = createHash('sha256')
+  let written = 0
+  let overflow = false
+  // A pass-through that counts + hashes bytes and trips the cap mid-stream.
+  // Erroring here makes `pipeline` tear down the whole chain (source fetch
+  // stream + file write stream) and reject, so we then unlink the partial.
+  const limiter = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      written += chunk.length
+      if (written > maxBytes) {
+        overflow = true
+        cb(new Error('attachment exceeds the maximum download size'))
+        return
+      }
+      hasher.update(chunk)
+      cb(null, chunk)
+    },
+  })
+
+  try {
+    // `flags: 'wx'` (O_EXCL) refuses to follow/clobber an existing symlink or
+    // file at the target; `mode: 0o600` keeps the confidential bytes private.
+    await pipeline(
+      Readable.fromWeb(res.body as any),
+      limiter,
+      createWriteStream(finalPath, { flags: 'wx', mode: 0o600 }),
+    )
+  } catch (e: any) {
+    await rm(finalPath, { force: true }).catch(() => {})
+    if (overflow) {
+      return {
+        ok: false,
+        status: 413,
+        detail: `attachment exceeds the maximum download size (${maxBytes} bytes)`,
+        json: null,
+      }
+    }
+    // Aborted turn, network/TLS error, or disk failure mid-stream.
+    return { ok: false, status: 0, detail: String(e?.message ?? e), json: null }
+  }
+
+  return {
+    ok: true,
+    data: {
+      local_path: finalPath,
+      filename,
+      mime_type: mime,
+      size: written,
+      sha256: hasher.digest('hex'),
+      source: { attachment_ref: refHeader, source },
+    },
+  }
 }
 
 // Visible-reply write-back used by the dispatch deliver fallback + the proactive
@@ -545,24 +774,6 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       ...(p.target ? { target: p.target } : {}),
       ...(p.message_id ? { message_id: p.message_id } : {}),
       ...(p.limit != null ? { limit: p.limit } : {}),
-    }),
-  },
-  {
-    name: 'de_attachment_view',
-    verb: 'attachment-view',
-    description:
-      'Get metadata for an inbound attachment (filename, mime type, size, ref). Identify it by `attachment_ref` (e.g. "<message_id>:0") or by `message_id` + `attachment_index`.',
-    parameters: Type.Object({
-      attachment_ref: Type.Optional(Type.String({ description: 'Canonical "<message_id>:<index>" ref.' })),
-      message_id: Type.Optional(Type.String({ description: 'Message id (with attachment_index).' })),
-      attachment_index: Type.Optional(Type.Integer({ minimum: 0, maximum: 64 })),
-    }),
-    // Force metadata_only — a model tool returns the pointer/metadata, not raw bytes.
-    buildBody: (p) => ({
-      metadata_only: true,
-      ...(p.attachment_ref ? { attachment_ref: p.attachment_ref } : {}),
-      ...(p.message_id ? { message_id: p.message_id } : {}),
-      ...(p.attachment_index != null ? { attachment_index: p.attachment_index } : {}),
     }),
   },
   {
@@ -755,10 +966,64 @@ function buildGenteamTools(toolCtx: any): any[] {
     },
   }))
 
+  // Inbound attachment read — by default DOWNLOADS the bytes to a local file on
+  // the gateway and returns its `local_path` (the agent then Reads that path;
+  // for images, Read it directly), reaching parity with the sandbox/local `de
+  // attachment-view`. The body is streamed straight to disk by
+  // `downloadAttachmentToDisk` (never buffered), the filename is sanitized to a
+  // safe basename, and a size cap guards against OOM/disk abuse. Passing
+  // `metadata_only: true` keeps the cheap pointer-only JSON path (filename /
+  // mime / size, no byte egress).
+  const attachmentView = {
+    name: 'de_attachment_view',
+    label: 'de_attachment_view',
+    description:
+      'Download an inbound attachment to a local file on this gateway and return its `local_path` (Read that path to inspect it; for image attachments, Read it directly), plus filename, mime type, size, and sha256. Identify it by `attachment_ref` (e.g. "<message_id>:0") or by `message_id` + `attachment_index`. Pass `metadata_only: true` to fetch only the filename/mime/size without downloading the bytes.',
+    parameters: Type.Object({
+      attachment_ref: Type.Optional(Type.String({ description: 'Canonical "<message_id>:<index>" ref.' })),
+      message_id: Type.Optional(Type.String({ description: 'Message id (with attachment_index).' })),
+      attachment_index: Type.Optional(Type.Integer({ minimum: 0, maximum: 64 })),
+      metadata_only: Type.Optional(
+        Type.Boolean({ description: 'Return only filename/mime/size without downloading the bytes.' }),
+      ),
+    }),
+    execute: async (
+      _toolCallId: string,
+      params: any,
+      signal: AbortSignal | undefined,
+    ): Promise<any> => {
+      const state = connectionsByAccount.get(accountId)
+      if (!state) {
+        return toolText(`error: the GenTeam connection for account "${accountId}" is not active right now.`, true)
+      }
+      const ids: Record<string, any> = {}
+      if (params?.attachment_ref) ids.attachment_ref = String(params.attachment_ref)
+      if (params?.message_id) ids.message_id = String(params.message_id)
+      if (params?.attachment_index != null) ids.attachment_index = params.attachment_index
+      if (!ids.attachment_ref && !ids.message_id) {
+        return toolText('error: pass `attachment_ref` (e.g. "<message_id>:0") or `message_id`.', true)
+      }
+      try {
+        // Cheap pointer-only mode: the plain JSON agent_tools call.
+        if (params?.metadata_only === true) {
+          const res = await callAgentTool(state, 'attachment-view', { metadata_only: true, ...ids }, signal)
+          return toolResultFromCall(res)
+        }
+        // Default: stream the bytes to disk and hand back the local path.
+        const r = await downloadAttachmentToDisk(state, ids, signal)
+        if (r.ok) return toolText(JSON.stringify({ ok: true, ...r.data }))
+        if (r.json) return toolResultFromCall({ status: r.status, ok: false, json: r.json, text: r.detail })
+        return toolText(`error: ${r.detail}`, true)
+      } catch (e: any) {
+        return toolText(`error: ${String(e?.message ?? e)}`, true)
+      }
+    },
+  }
+
   // Local-file attachment send — reads file paths from the gateway agent's own
   // filesystem and uploads them via the shared 1 GiB session+SAS direct-upload
   // core (per-file init → streamed PUT straight to Azure Blob → ONE batch
-  // finalize), the SAME path the local/sandbox `de` CLI uses. The legacy
+  // finalize), the SAME path the Local Computer daemon uses. The legacy
   // multipart endpoint is no longer used.
   const sendAttachment = {
     name: 'de_message_send_attachment',
@@ -787,9 +1052,8 @@ function buildGenteamTools(toolCtx: any): any[] {
       if (rawPaths.length === 0) return toolText('error: `paths` must list at least one file.', true)
       // Fail fast on the count cap before the (per-path) allow-root resolution
       // so an over-count batch returns the count error regardless of which
-      // paths it contains — matching the local/sandbox `de` CLI, where the
-      // shared core checks the count before touching the filesystem. (The
-      // shared core re-checks.)
+      // paths it contains — matching the daemon, where the shared core checks
+      // the count before touching the filesystem. (The shared core re-checks.)
       if (rawPaths.length > GENTEAM_ATTACHMENT_MAX_COUNT) {
         return toolText(`error: too many attachments (max ${GENTEAM_ATTACHMENT_MAX_COUNT}).`, true)
       }
@@ -808,10 +1072,11 @@ function buildGenteamTools(toolCtx: any): any[] {
         safePaths.push(safePath)
       }
 
-      // SAME shared session+SAS core the local/sandbox `de` CLI uses: per-file
+      // SAME shared session+SAS core the Local Computer daemon uses: per-file
       // init → streamed PUT straight to Azure Blob → ONE batch finalize. So a
-      // 1 GiB file never buffers in the gateway's memory or crosses the backend,
-      // and all files land in ONE media message rather than the legacy 99 MiB
+      // 1 GiB file never
+      // buffers in the gateway's memory or crosses the backend, and all files
+      // land in ONE secure_media message rather than the legacy 99 MiB
       // multipart path. Transport is this plugin's agent-token-authed POST to
       // the configured endpoint; the SAS PUT goes direct to storage inside the
       // shared core.
@@ -868,13 +1133,16 @@ function buildGenteamTools(toolCtx: any): any[] {
     },
   }
 
-  return [...jsonTools, sendAttachment]
+  return [...jsonTools, attachmentView, sendAttachment]
 }
 
 // All de tool names — also declared in openclaw.plugin.json `contracts.tools`
 // (the registry rejects any registerTool name not in the manifest).
+// `de_attachment_view` (byte-materializing) and `de_message_send_attachment`
+// are dedicated tools, not plain JSON verbs, so they're listed explicitly.
 const DE_TOOL_NAMES: string[] = [
   ...DE_TOOL_DEFS.map((d) => d.name),
+  'de_attachment_view',
   'de_message_send_attachment',
 ]
 

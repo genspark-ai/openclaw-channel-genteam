@@ -1,6 +1,6 @@
 {
   "name": "@genspark/genteam",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "OpenClaw channel plugin connecting a self-hosted OpenClaw gateway to GenTeam as an Agent runtime",
   "type": "module",
   "main": "dist/index.js",

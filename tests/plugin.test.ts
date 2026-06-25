@@ -13,8 +13,16 @@
 // Run with `npm test` (node --import tsx --test).
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, test } from 'node:test'
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import {
@@ -75,7 +83,19 @@ interface CapturedFetch {
 
 // Install a fake global.fetch that records calls and returns a canned envelope.
 function installFakeFetch(
-  responder: (url: string, init: any) => { status?: number; json?: any; text?: string },
+  responder: (
+    url: string,
+    init: any,
+  ) => {
+    status?: number
+    json?: any
+    text?: string
+    // Binary/streamed response support: when either is present the fake
+    // returns a REAL `Response` so the code under test gets a working
+    // `.headers.get()` + `.body` web stream (the attachment-download path).
+    headers?: Record<string, string>
+    bodyBytes?: Uint8Array
+  },
 ): { calls: CapturedFetch[]; restore: () => void } {
   const calls: CapturedFetch[] = []
   const original = globalThis.fetch
@@ -89,6 +109,11 @@ function installFakeFetch(
     }
     calls.push({ url: String(url), method: init?.method ?? 'GET', headers, body: parsed })
     const r = responder(String(url), init)
+    if (r.bodyBytes !== undefined || r.headers !== undefined) {
+      const status = r.status ?? 200
+      const bytes = r.bodyBytes ?? new Uint8Array(0)
+      return new Response(bytes as any, { status, headers: r.headers ?? {} }) as any
+    }
     const text = r.text ?? JSON.stringify(r.json ?? { status: 0 })
     return {
       ok: (r.status ?? 200) < 400,
@@ -219,19 +244,317 @@ test('de_task_claim forwards message_id (create-and-claim from a message)', asyn
   }
 })
 
-test('attachment-view forces metadata_only (a model tool never streams bytes)', async () => {
+test('de_attachment_view metadata_only:true uses the cheap JSON path (no byte download)', async () => {
   const state = fakeConnection()
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch(() => ({
+    json: { ok: true, attachment: { attachment_ref: 'm1:0' }, metadata_only: true },
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0', metadata_only: true }, undefined)
+    assert.equal(calls[0].body.verb, 'attachment-view')
+    assert.equal(calls[0].body.metadata_only, true)
+    assert.equal(calls[0].body.attachment_ref, 'm1:0')
+    // No file is written on the metadata path; the JSON envelope is returned.
+    assert.ok(out.content[0].text.includes('"metadata_only":true'))
+  } finally {
+    restore()
+  }
+})
+
+// Helper: a connection whose downloads land in a fresh temp dir we can inspect.
+function downloadConnection(downloadDir?: string): ConnectionState {
+  const base = fakeConnection()
+  return fakeConnection({ cfg: { ...base.cfg, attachmentDownloadDir: downloadDir } })
+}
+
+test('de_attachment_view downloads bytes to a local file and returns local_path', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const bytes = Buffer.from('the real image bytes  ÿ', 'binary')
+  const { calls, restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: {
+      'x-de-attachment-filename': 'IMG_5410.jpg',
+      'x-de-attachment-mime': 'image/jpeg',
+      'x-de-attachment-size': String(bytes.length),
+      'x-de-attachment-ref': '36091:0',
+      'x-de-attachment-source': 'secure_media',
+    },
+    bodyBytes: new Uint8Array(bytes),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: '36091:0' }, undefined)
+    // The backend is called in BINARY mode (metadata_only:false), not metadata.
+    assert.equal(calls[0].body.verb, 'attachment-view')
+    assert.equal(calls[0].body.metadata_only, false)
+    const res = JSON.parse(out.content[0].text)
+    assert.equal(res.ok, true)
+    assert.equal(res.filename, 'IMG_5410.jpg')
+    assert.equal(res.mime_type, 'image/jpeg')
+    assert.equal(res.size, bytes.length)
+    // `source` is a nested object for parity with the sandbox/local CLI shape.
+    assert.equal(res.source.attachment_ref, '36091:0')
+    assert.equal(res.source.source, 'secure_media')
+    assert.match(res.sha256, /^[0-9a-f]{64}$/)
+    // The file lands inside the configured download dir and holds the bytes.
+    assert.equal(dirname(res.local_path), dir)
+    assert.ok(existsSync(res.local_path))
+    assert.deepEqual(readFileSync(res.local_path), bytes)
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('de_attachment_view sanitizes a hostile filename (no path traversal escape)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const bytes = Buffer.from('payload')
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: {
+      // Hostile: path separators + traversal must NOT escape the download dir.
+      'x-de-attachment-filename': '../../../../etc/passwd',
+      'x-de-attachment-mime': 'text/plain',
+      'x-de-attachment-ref': '36091:0',
+    },
+    bodyBytes: new Uint8Array(bytes),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: '36091:0' }, undefined)
+    const res = JSON.parse(out.content[0].text)
+    assert.equal(res.ok, true)
+    // Written strictly inside the download dir; no traversal, no path parts.
+    assert.equal(dirname(res.local_path), dir)
+    assert.ok(!res.local_path.includes('..'))
+    assert.ok(!res.local_path.includes('/etc/passwd'))
+    assert.ok(existsSync(res.local_path))
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('de_attachment_view rejects an oversized attachment by declared size (no write)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: {
+      'x-de-attachment-filename': 'huge.bin',
+      // 1 TiB — far above the 1 GiB cap regardless of its exact value.
+      'x-de-attachment-size': String(1024 ** 4),
+      'x-de-attachment-ref': '36091:0',
+    },
+    bodyBytes: new Uint8Array([1, 2, 3]),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: '36091:0' }, undefined)
+    assert.equal(out.isError, true)
+    assert.match(out.content[0].text, /too large/i)
+    // Nothing was materialized — the dir stays empty (size check precedes write).
+    assert.deepEqual(readdirSync(dir), [])
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('de_attachment_view defaults the download dir to the system temp dir when unconfigured', async () => {
+  const state = downloadConnection(undefined)
+  connectionsByAccount.set('default', state)
+  const bytes = Buffer.from('x')
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: { 'x-de-attachment-filename': 'a.txt', 'x-de-attachment-ref': 'm7:1' },
+    bodyBytes: new Uint8Array(bytes),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm7:1' }, undefined)
+    const res = JSON.parse(out.content[0].text)
+    assert.equal(res.ok, true)
+    // Default dir is a private per-process mkdtemp dir under the system temp dir.
+    assert.ok(dirname(res.local_path).startsWith(join(tmpdir(), 'genteam-attachments-')))
+    rmSync(res.local_path, { force: true })
+  } finally {
+    restore()
+  }
+})
+
+test('de_attachment_view requires an attachment_ref or message_id', async () => {
+  const state = downloadConnection()
   connectionsByAccount.set('default', state)
   const { calls, restore } = installFakeFetch(() => ({ json: { status: 0 } }))
   try {
     const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
     const view = tools.find((t: any) => t.name === 'de_attachment_view')
-    await view.execute('c', { attachment_ref: 'm1:0' }, undefined)
-    assert.equal(calls[0].body.verb, 'attachment-view')
-    assert.equal(calls[0].body.metadata_only, true)
-    assert.equal(calls[0].body.attachment_ref, 'm1:0')
+    const out = await view.execute('c', {}, undefined)
+    assert.equal(out.isError, true)
+    assert.equal(calls.length, 0, 'no backend call without an identifier')
   } finally {
     restore()
+  }
+})
+
+// Acceptance criterion #5: a backend 403/404 (non-member / wrong agent / bad
+// ref) must surface as a tool error and write NOTHING to disk — the plugin must
+// not let a forbidden download succeed.
+test('de_attachment_view surfaces a backend 403 and writes no file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch(() => ({
+    status: 403,
+    headers: { 'content-type': 'application/json' },
+    bodyBytes: new TextEncoder().encode(JSON.stringify({ status: 1, error: 'not_a_member' })),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0' }, undefined)
+    assert.equal(out.isError, true)
+    assert.match(out.content[0].text, /HTTP 403/)
+    assert.match(out.content[0].text, /not_a_member/)
+    assert.deepEqual(readdirSync(dir), [], 'a forbidden download must not materialize a file')
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Acceptance criterion #6: the mid-stream cap is the REAL enforcement (the
+// declared-size header is advisory). Drive a body past a low per-account cap
+// with NO size header so the limiter Transform trips, and assert the partial is
+// cleaned up.
+test('de_attachment_view trips the mid-stream cap and removes the partial file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const base = downloadConnection(dir)
+  const state = fakeConnection({ cfg: { ...base.cfg, attachmentDownloadMaxBytes: 4 } })
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    // No x-de-attachment-size header → the up-front check can't fire; only the
+    // mid-stream limiter can catch this.
+    headers: { 'x-de-attachment-filename': 'big.bin', 'x-de-attachment-ref': 'm1:0' },
+    bodyBytes: new Uint8Array(Buffer.alloc(64, 1)),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0' }, undefined)
+    assert.equal(out.isError, true)
+    assert.match(out.content[0].text, /exceeds the maximum download size/)
+    assert.deepEqual(readdirSync(dir), [], 'the partial file must be unlinked on overflow')
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// A turn.abort mid-download must surface as an error and leave no partial file.
+test('de_attachment_view cleans up and errors when the turn is aborted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const aborted = new AbortController()
+  aborted.abort()
+  const { restore } = installFakeFetch((_url, init) => {
+    // Mirror real fetch: reject when handed an already-aborted signal.
+    if (init?.signal?.aborted) throw new Error('The operation was aborted')
+    return { status: 200, headers: { 'x-de-attachment-ref': 'm1:0' }, bodyBytes: new Uint8Array([1]) }
+  })
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0' }, aborted.signal)
+    assert.equal(out.isError, true)
+    assert.deepEqual(readdirSync(dir), [], 'no partial file after an aborted download')
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Acceptance criterion #4: the materialized result must never carry a secure
+// media URL, SAS/blob token, or cookie — even if the backend response grew
+// extra headers. The tool only echoes the documented X-DE-Attachment-* fields.
+test('de_attachment_view never leaks secret-shaped headers into the result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'genteam-dl-'))
+  const state = downloadConnection(dir)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: {
+      'x-de-attachment-filename': 'a.txt',
+      'x-de-attachment-ref': 'm1:0',
+      // Decoy secrets the tool must ignore.
+      'x-de-secure-media-url': 'https://acct.blob.core.windows.net/c/x?sig=SECRETSAS',
+      'x-ms-signature': 'SECRETSAS',
+      'set-cookie': 'session_id=SECRETCOOKIE',
+    },
+    bodyBytes: new Uint8Array([120]),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0' }, undefined)
+    const text = out.content[0].text
+    assert.ok(!text.includes('blob.core.windows.net'))
+    assert.ok(!text.includes('SECRETSAS'))
+    assert.ok(!text.includes('session_id'))
+    // Only the documented MaterializedAttachment keys are present.
+    const res = JSON.parse(text)
+    assert.deepEqual(
+      Object.keys(res).sort(),
+      ['filename', 'local_path', 'mime_type', 'ok', 'sha256', 'size', 'source'],
+    )
+    rmSync(res.local_path, { force: true })
+  } finally {
+    restore()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// A symlink pre-planted at the (configured) download dir must be refused, not
+// followed — defends the materialization path the way the upload path already
+// defends its roots.
+test('de_attachment_view refuses a symlinked download dir', async () => {
+  const realParent = mkdtempSync(join(tmpdir(), 'genteam-dl-real-'))
+  const linkParent = mkdtempSync(join(tmpdir(), 'genteam-dl-link-'))
+  const linkDir = join(linkParent, 'dl')
+  symlinkSync(realParent, linkDir)
+  const state = downloadConnection(linkDir)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch(() => ({
+    status: 200,
+    headers: { 'x-de-attachment-filename': 'a.txt', 'x-de-attachment-ref': 'm1:0' },
+    bodyBytes: new Uint8Array([1, 2, 3]),
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const view = tools.find((t: any) => t.name === 'de_attachment_view')
+    const out = await view.execute('c', { attachment_ref: 'm1:0' }, undefined)
+    assert.equal(out.isError, true)
+    assert.match(out.content[0].text, /symlink/)
+    assert.deepEqual(readdirSync(realParent), [], 'nothing written through the symlink')
+  } finally {
+    restore()
+    rmSync(linkParent, { recursive: true, force: true })
+    rmSync(realParent, { recursive: true, force: true })
   }
 })
 
