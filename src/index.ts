@@ -51,6 +51,17 @@ import { createRequire } from 'module'
 // typebox re-normalizes and validates, so there is no cross-version skew.
 import { Type } from 'typebox'
 
+// Shared GenTeam attachment session+SAS direct-upload core — the SAME module
+// the local/sandbox `de` CLI uses. It is a relative source import, so (unlike
+// `typebox`/`ws`) esbuild `--bundle` INLINES it into dist/index.js; there is no
+// runtime dependency on any sibling package.
+import {
+  uploadAttachmentsViaSession,
+  combineSignals,
+  GENTEAM_ATTACHMENT_MAX_COUNT,
+  type AgentToolPost,
+} from '../shared/attachment-upload.ts'
+
 // Prefer the `ws` npm package over Node.js built-in WebSocket.
 // OpenClaw's gateway calls undici.setGlobalDispatcher() which corrupts the
 // built-in WebSocket (also undici-based) handshake, causing "Received network
@@ -63,7 +74,14 @@ import { Type } from 'typebox'
 // Only if BOTH miss do we fall back to the built-in WebSocket — and we WARN,
 // because that path is known-broken under the gateway's undici dispatcher and a
 // silent fallback would dead-end every connect with a cryptic error.
-let WsWebSocket: typeof WebSocket = WebSocket
+// `WebSocket` is a runtime global only on Node >= 21; a bare value reference
+// throws ReferenceError on the Node 18-20 floor before the `ws` resolution
+// below runs. Guard it with `typeof` (the one safe way to read a possibly
+// undeclared global) — this last-resort fallback is the known-broken path
+// anyway, so leaving it undefined when both `ws` resolution AND the global miss
+// only defers to the explicit warn below.
+let WsWebSocket: typeof WebSocket =
+  typeof WebSocket !== 'undefined' ? WebSocket : (undefined as unknown as typeof WebSocket)
 let _wsResolved = false
 for (const resolveFrom of [
   () => import.meta.url,
@@ -103,9 +121,12 @@ const PLUGIN_VERSION: string = (() => {
 
 const AGENT_TOOLS_PREFIX = '/api/digital-employee/agent_tools'
 
-// Hard cap on a single outbound attachment (99 MiB).
-const DE_ATTACHMENT_MAX_BYTES = 103_809_024
-const DE_ATTACHMENT_MAX_COUNT = 10
+// The 1 GiB byte cap + 10-attachment count cap live in the shared
+// attachment-upload core (GENTEAM_DIRECT_UPLOAD_MAX_BYTES /
+// GENTEAM_ATTACHMENT_MAX_COUNT) as the single source of truth, drift-guarded
+// against the backend. Attachments go via that shared session+SAS core, so the
+// body never buffers in the gateway and the old 99 MiB multipart ceiling is
+// gone. Only the count is referenced here (the tool-schema maxItems bound).
 // Bound for a tool's agent_tools HTTP call. The per-turn lease is the real
 // bound; this just keeps
 // a single stalled fetch from hanging a turn.
@@ -356,7 +377,9 @@ async function callAgentTool(
       Authorization: `Bearer ${auth.agentToken}`,
     },
     body: JSON.stringify({ verb, ...body }),
-    signal: signal ?? AbortSignal.timeout(timeoutMs),
+    // Combine, don't XOR: a caller-supplied turn-abort signal must NOT disarm
+    // the per-request stall timeout (the attachment path always passes one).
+    signal: combineSignals(signal, timeoutMs),
   })
   const text = await res.text()
   let json: any = null
@@ -725,15 +748,18 @@ function buildGenteamTools(toolCtx: any): any[] {
     },
   }))
 
-  // Multipart attachment send — reads file paths from the gateway agent's own
-  // filesystem and uploads them via the dedicated multipart endpoint.
+  // Local-file attachment send — reads file paths from the gateway agent's own
+  // filesystem and uploads them via the shared 1 GiB session+SAS direct-upload
+  // core (per-file init → streamed PUT straight to Azure Blob → ONE batch
+  // finalize), the SAME path the local/sandbox `de` CLI uses. The legacy
+  // multipart endpoint is no longer used.
   const sendAttachment = {
     name: 'de_message_send_attachment',
     label: 'de_message_send_attachment',
     description:
-      'Send one or more local files as a GenTeam message attachment (up to 10, 99 MiB each). `paths` must be absolute paths under configured attachment roots; if no roots are configured, local uploads are disabled. Optional `content` is the caption. `target` defaults to the current conversation.',
+      'Send one or more local files as a GenTeam message attachment (up to 10, 1 GiB each). `paths` must be absolute paths under configured attachment roots; if no roots are configured, local uploads are disabled. Optional `content` is the caption. `target` defaults to the current conversation.',
     parameters: Type.Object({
-      paths: Type.Array(Type.String(), { minItems: 1, maxItems: DE_ATTACHMENT_MAX_COUNT, description: 'Local file paths to upload.' }),
+      paths: Type.Array(Type.String(), { minItems: 1, maxItems: GENTEAM_ATTACHMENT_MAX_COUNT, description: 'Local file paths to upload.' }),
       content: Type.Optional(Type.String({ description: 'Optional caption.' })),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
       parent_message: Type.Optional(Type.String({ description: 'Open/post into a thread.' })),
@@ -750,54 +776,86 @@ function buildGenteamTools(toolCtx: any): any[] {
       const turn = currentTurn(state)
       const target: string = params?.target || turn?.replyTarget || ''
       if (!target) return toolText('error: no target — pass `target`.', true)
-      const paths: string[] = Array.isArray(params?.paths) ? params.paths : []
-      if (paths.length === 0) return toolText('error: `paths` must list at least one file.', true)
-      if (paths.length > DE_ATTACHMENT_MAX_COUNT) {
-        return toolText(`error: too many attachments (max ${DE_ATTACHMENT_MAX_COUNT}).`, true)
+      const rawPaths: string[] = Array.isArray(params?.paths) ? params.paths : []
+      if (rawPaths.length === 0) return toolText('error: `paths` must list at least one file.', true)
+      // Fail fast on the count cap before the (per-path) allow-root resolution
+      // so an over-count batch returns the count error regardless of which
+      // paths it contains — matching the local/sandbox `de` CLI, where the
+      // shared core checks the count before touching the filesystem. (The
+      // shared core re-checks.)
+      if (rawPaths.length > GENTEAM_ATTACHMENT_MAX_COUNT) {
+        return toolText(`error: too many attachments (max ${GENTEAM_ATTACHMENT_MAX_COUNT}).`, true)
       }
-      const form = new FormData()
-      form.set('target', target)
-      if (params?.content) form.set('text', String(params.content))
-      if (params?.parent_message) form.set('parent_message', String(params.parent_message))
-      try {
-        for (const p of paths) {
-          const safePath = normalizeAllowedAttachmentPath(String(p), state.cfg.attachmentRoots)
-          if (!safePath) {
-            return toolText(
-              `error: attachment path is outside the allowed roots (${formatAttachmentRoots(state.cfg.attachmentRoots)}): ${p}`,
-              true,
-            )
-          }
-          const buf = readFileSync(safePath)
-          if (buf.length === 0) return toolText(`error: attachment is empty: ${safePath}`, true)
-          if (buf.length > DE_ATTACHMENT_MAX_BYTES) {
-            return toolText(`error: attachment exceeds the 99 MiB cap: ${safePath}`, true)
-          }
-          const fname = safePath.split('/').pop() || 'file'
-          form.append('file', new Blob([new Uint8Array(buf)]), fname)
+
+      // Resolve every path against the configured attachment roots BEFORE the
+      // upload — the agent may only read files under an allow-listed root.
+      const safePaths: string[] = []
+      for (const p of rawPaths) {
+        const safePath = normalizeAllowedAttachmentPath(String(p), state.cfg.attachmentRoots)
+        if (!safePath) {
+          return toolText(
+            `error: attachment path is outside the allowed roots (${formatAttachmentRoots(state.cfg.attachmentRoots)}): ${p}`,
+            true,
+          )
         }
-      } catch (e: any) {
-        return toolText(`error: failed to read attachment: ${String(e?.message ?? e)}`, true)
+        safePaths.push(safePath)
       }
-      const url = `${state.cfg.endpoint}${AGENT_TOOLS_PREFIX}/message-send-attachment`
+
+      // SAME shared session+SAS core the local/sandbox `de` CLI uses: per-file
+      // init → streamed PUT straight to Azure Blob → ONE batch finalize. So a
+      // 1 GiB file never buffers in the gateway's memory or crosses the backend,
+      // and all files land in ONE media message rather than the legacy 99 MiB
+      // multipart path. Transport is this plugin's agent-token-authed POST to
+      // the configured endpoint; the SAS PUT goes direct to storage inside the
+      // shared core.
+      const post: AgentToolPost = async (verb, payload, sig) => {
+        const r = await callAgentTool(state, verb, payload, sig, TOOL_ATTACHMENT_HTTP_TIMEOUT_MS)
+        return { status: r.status, body: r.text }
+      }
       try {
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${state.auth.agentToken}` },
-          body: form,
-          signal: signal ?? AbortSignal.timeout(TOOL_ATTACHMENT_HTTP_TIMEOUT_MS),
+        const result = await uploadAttachmentsViaSession({
+          files: safePaths,
+          target,
+          text: params?.content != null ? String(params.content) : null,
+          parentMessage: params?.parent_message != null ? String(params.parent_message) : null,
+          post,
+          signal,
+          putTimeoutMs: TOOL_ATTACHMENT_HTTP_TIMEOUT_MS,
         })
-        const text = await res.text()
-        let json: any = null
-        try {
-          json = JSON.parse(text)
-        } catch {
-          /* non-JSON */
+        if (result.ok) {
+          if (turn) turn.sentCount += 1
+          let json: any = null
+          try {
+            json = JSON.parse(result.body)
+          } catch {
+            /* non-JSON 2xx body — passed through as text */
+          }
+          return toolResultFromCall({ status: result.status, ok: true, json, text: result.body })
         }
-        const ok = res.ok && (json == null || json.status === undefined || json.status === 0)
-        if (ok && turn) turn.sentCount += 1
-        return toolResultFromCall({ status: res.status, ok, json, text })
+        // A backend HTTP rejection carries the server's typed envelope — render
+        // it through the same `error (HTTP <status>): <detail>` formatter the
+        // other de tools use, for a consistent model-facing error shape. A
+        // client-side failure (path / size / network / hashing) has no server
+        // body, so surface its typed message directly.
+        if (result.serverBody !== undefined) {
+          let json: any = null
+          try {
+            json = JSON.parse(result.serverBody)
+          } catch {
+            /* non-JSON backend body */
+          }
+          return toolResultFromCall({
+            status: result.httpStatus ?? 0,
+            ok: false,
+            json,
+            text: result.serverBody,
+          })
+        }
+        return toolText(`error: ${result.message}`, true)
       } catch (e: any) {
+        // Defensive: the shared core returns a discriminated result rather than
+        // throwing, but a truly unexpected throw (e.g. an fs race) must still
+        // surface as a clean tool error, not a rejected execute() promise.
         return toolText(`error: ${String(e?.message ?? e)}`, true)
       }
     },
@@ -1023,7 +1081,7 @@ function connectGenteamWs(opts: {
         // Start application ping once the handshake completes.
         if (pingTimer) clearInterval(pingTimer)
         pingTimer = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
+          if (ws.readyState === WsWebSocket.OPEN) {
             try {
               ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
             } catch {
@@ -1039,7 +1097,7 @@ function connectGenteamWs(opts: {
         // Backend-initiated heartbeat — respond pong (echo ts when present).
         const pong: Record<string, any> = { type: 'pong' }
         if (typeof frame.ts === 'number') pong.ts = frame.ts
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === WsWebSocket.OPEN) {
           try {
             ws.send(JSON.stringify(pong))
           } catch {
@@ -1130,7 +1188,7 @@ async function dispatchTurnToAgent(
   // the backend drops any turn.done/turn.error that lacks them
   // (it re-validates the bound agent + runtime before finalizing the inbox).
   function emitTurnDone(): void {
-    if (ws.readyState !== WebSocket.OPEN) return
+    if (ws.readyState !== WsWebSocket.OPEN) return
     try {
       ws.send(
         JSON.stringify({
@@ -1145,7 +1203,7 @@ async function dispatchTurnToAgent(
     }
   }
   function emitTurnError(error: string): void {
-    if (ws.readyState !== WebSocket.OPEN) return
+    if (ws.readyState !== WsWebSocket.OPEN) return
     try {
       ws.send(
         JSON.stringify({

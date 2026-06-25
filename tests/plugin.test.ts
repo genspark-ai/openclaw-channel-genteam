@@ -254,7 +254,24 @@ test('message-send-attachment only reads files under configured attachment roots
   const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
   state.turns.set('turn-1', turn)
   connectionsByAccount.set('default', state)
-  const { calls, restore } = installFakeFetch(() => ({ json: { status: 0, comet_message_id: 'm1' } }))
+  const { calls, restore } = installFakeFetch((url: string) => {
+    // Route the SHARED session+SAS flow: init mints a SAS, the direct PUT
+    // lands the bytes, finalize sends the message.
+    if (url.endsWith('/attachment-session-init')) {
+      return {
+        json: {
+          ok: true,
+          upload_url: 'https://blob.test/sas',
+          upload_session: 'sess',
+          content_type: 'text/plain',
+        },
+      }
+    }
+    if (url.endsWith('/attachment-session-finalize')) {
+      return { json: { ok: true, comet_message_id: 'm1', attachments: [{ attachment_ref: 'm1:0' }] } }
+    }
+    return { status: 201, text: '' } // direct SAS PUT
+  })
   try {
     const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
     const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
@@ -269,16 +286,296 @@ test('message-send-attachment only reads files under configured attachment roots
     assert.match(symlinked.content[0].text, /outside the allowed roots/)
     assert.equal(calls.length, 0, 'symlink escapes are rejected before any upload request')
 
+    // Allowed path → the SHARED session+SAS flow (init → direct PUT →
+    // finalize), NOT the legacy 99 MiB multipart endpoint.
     const allowed = await sendAttachment.execute('c', { paths: [allowedPath] }, undefined)
     assert.equal(allowed.isError, undefined)
-    assert.equal(calls.length, 1)
-    assert.equal(calls[0].url, 'https://example.test/api/digital-employee/agent_tools/message-send-attachment')
+    assert.ok(
+      calls.some((c) => c.url.endsWith('/agent_tools/attachment-session-init')),
+      'session-init must be called',
+    )
+    assert.ok(
+      calls.some((c) => c.url === 'https://blob.test/sas' && c.method === 'PUT'),
+      'the body must PUT direct to the SAS URL',
+    )
+    assert.ok(
+      calls.some((c) => c.url.endsWith('/agent_tools/attachment-session-finalize')),
+      'session-finalize must be called',
+    )
+    assert.ok(
+      !calls.some((c) => c.url.endsWith('/message-send-attachment')),
+      'the legacy multipart endpoint must not be used',
+    )
+    // The PUT must declare the Azure single-PutBlob headers with a real
+    // Content-Length (== the 5 bytes of 'hello') and the backend-resolved type —
+    // not chunked, not a wrong/zero length.
+    const put = calls.find((c) => c.method === 'PUT' && c.url === 'https://blob.test/sas')
+    assert.ok(put, 'a direct SAS PUT must have been issued')
+    assert.equal(put!.headers['x-ms-blob-type'], 'BlockBlob')
+    assert.equal(put!.headers['Content-Type'], 'text/plain')
+    assert.equal(put!.headers['Content-Length'], '5')
     assert.equal(turn.sentCount, 1)
   } finally {
     restore()
     connectionsByAccount.clear()
     rmSync(root, { recursive: true, force: true })
     rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('de_message_send_attachment sends MULTIPLE files as ONE batch via the shared session flow', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-multi-'))
+  const a = join(root, 'a.txt')
+  const b = join(root, 'b.txt')
+  const c = join(root, 'c.txt')
+  writeFileSync(a, 'AAA')
+  writeFileSync(b, 'BBB')
+  writeFileSync(c, 'CCC')
+
+  const state = fakeConnection({
+    cfg: { ...fakeConnection().cfg, attachmentRoots: [root] },
+  })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  let initCount = 0
+  let finalizeBody: any = null
+  const { calls, restore } = installFakeFetch((url: string, init: any) => {
+    if (url.endsWith('/attachment-session-init')) {
+      initCount += 1
+      return {
+        json: {
+          ok: true,
+          upload_url: `https://blob.test/sas-${initCount}`,
+          upload_session: `sess-${initCount}`,
+          content_type: 'text/plain',
+        },
+      }
+    }
+    if (url.endsWith('/attachment-session-finalize')) {
+      try {
+        finalizeBody = JSON.parse(init.body)
+      } catch {
+        /* ignore */
+      }
+      return { json: { ok: true, comet_message_id: 'm1', attachments: [{ attachment_ref: 'm1:0' }] } }
+    }
+    return { status: 201, text: '' }
+  })
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+    const res = await sendAttachment.execute('c', { paths: [a, b, c], content: 'three files' }, undefined)
+    assert.equal(res.isError, undefined)
+    // 3 inits + 3 direct PUTs + exactly 1 finalize (NOT 3 messages).
+    assert.equal(initCount, 3)
+    const puts = calls.filter((c) => c.method === 'PUT')
+    assert.equal(puts.length, 3)
+    // Every PUT declares the BlockBlob headers with each file's real 3-byte
+    // length (no chunked transfer, no shared/zero length).
+    for (const p of puts) {
+      assert.equal(p.headers['x-ms-blob-type'], 'BlockBlob')
+      assert.equal(p.headers['Content-Length'], '3')
+    }
+    assert.equal(calls.filter((c) => c.url.endsWith('/attachment-session-finalize')).length, 1)
+    assert.ok(finalizeBody && Array.isArray(finalizeBody.files) && finalizeBody.files.length === 3)
+    assert.deepEqual(
+      finalizeBody.files.map((f: any) => f.upload_session),
+      ['sess-1', 'sess-2', 'sess-3'],
+    )
+    assert.equal(finalizeBody.text, 'three files')
+    assert.equal(turn.sentCount, 1)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('de_message_send_attachment surfaces a backend finalize rejection as an error tool result', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-rej-'))
+  const f = join(root, 'f.txt')
+  writeFileSync(f, 'hi')
+  const state = fakeConnection({ cfg: { ...fakeConnection().cfg, attachmentRoots: [root] } })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch((url: string) => {
+    if (url.endsWith('/attachment-session-init')) {
+      return {
+        json: { ok: true, upload_url: 'https://blob.test/sas', upload_session: 'sess', content_type: 'text/plain' },
+      }
+    }
+    if (url.endsWith('/attachment-session-finalize')) {
+      // Backend rejects finalize (e.g. replay / membership).
+      return { status: 409, json: { ok: false, code: 'UPLOAD_SESSION_ALREADY_CONSUMED' } }
+    }
+    return { status: 201, text: '' }
+  })
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+    const res = await sendAttachment.execute('c', { paths: [f] }, undefined)
+    // Rendered through the shared `error (HTTP <status>): <detail>` formatter,
+    // carrying the backend's typed envelope.
+    assert.equal(res.isError, true)
+    assert.match(res.content[0].text, /error \(HTTP 409\)/)
+    assert.match(res.content[0].text, /UPLOAD_SESSION_ALREADY_CONSUMED/)
+    // A failed send must NOT count toward the turn's sent total.
+    assert.equal(turn.sentCount, 0)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('de_message_send_attachment surfaces a 200-but-ok:false finalize as an error result', async () => {
+  // A finalize that returns HTTP 200 with `ok:false` is a LOGICAL backend
+  // failure (distinct from a 4xx); it must still render as an error tool result
+  // carrying the server body, and must NOT count as a send.
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-okfalse-'))
+  const f = join(root, 'f.txt')
+  writeFileSync(f, 'hi')
+  const state = fakeConnection({ cfg: { ...fakeConnection().cfg, attachmentRoots: [root] } })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const { restore } = installFakeFetch((url: string) => {
+    if (url.endsWith('/attachment-session-init')) {
+      return {
+        json: { ok: true, upload_url: 'https://blob.test/sas', upload_session: 'sess', content_type: 'text/plain' },
+      }
+    }
+    if (url.endsWith('/attachment-session-finalize')) {
+      return { status: 200, json: { ok: false, code: 'FINALIZE_LOGICAL_FAIL' } }
+    }
+    return { status: 201, text: '' }
+  })
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+    const res = await sendAttachment.execute('c', { paths: [f] }, undefined)
+    assert.equal(res.isError, true)
+    assert.match(res.content[0].text, /error \(HTTP 200\)/)
+    assert.match(res.content[0].text, /FINALIZE_LOGICAL_FAIL/)
+    assert.equal(turn.sentCount, 0)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('de_message_send_attachment renders CLIENT-SIDE failures as plain `error:` results (no HTTP prefix), uncounted', async () => {
+  // The shared core distinguishes a backend HTTP rejection (echoed as
+  // `error (HTTP <status>)`) from a client-side failure (network / malformed
+  // init / validation), which the plugin surfaces as `error: <message>` with NO
+  // `(HTTP …)` prefix and no server body. Only the backend branch was tested;
+  // this pins the client-side branch (index.ts L835) the plugin relies on.
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-client-'))
+  const f = join(root, 'f.txt')
+  writeFileSync(f, 'hi')
+  const state = fakeConnection({ cfg: { ...fakeConnection().cfg, attachmentRoots: [root] } })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+  const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+  try {
+    // (a) transport failure on session-init → DE_NETWORK_ERROR
+    {
+      const { calls, restore } = installFakeFetch((url: string) => {
+        if (url.endsWith('/attachment-session-init')) throw new Error('connect ECONNREFUSED')
+        return { status: 201, text: '' }
+      })
+      try {
+        const res = await sendAttachment.execute('c', { paths: [f] }, undefined)
+        assert.equal(res.isError, true)
+        assert.match(res.content[0].text, /^error: /)
+        assert.doesNotMatch(res.content[0].text, /\(HTTP/)
+        assert.match(res.content[0].text, /network failure/)
+        assert.ok(!calls.some((c) => c.url.endsWith('/attachment-session-finalize')), 'finalize must not run')
+      } finally {
+        restore()
+      }
+    }
+    // (b) 2xx init missing upload_url → DE_SESSION_INIT_MALFORMED (typed, not echoed)
+    {
+      const { restore } = installFakeFetch((url: string) =>
+        url.endsWith('/attachment-session-init') ? { json: { ok: true } } : { status: 201, text: '' },
+      )
+      try {
+        const res = await sendAttachment.execute('c', { paths: [f] }, undefined)
+        assert.equal(res.isError, true)
+        assert.match(res.content[0].text, /^error: /)
+        assert.doesNotMatch(res.content[0].text, /\(HTTP/)
+        assert.match(res.content[0].text, /upload_url|upload_session|not JSON/)
+      } finally {
+        restore()
+      }
+    }
+    // (c) >10 files → DE_TOO_MANY_ATTACHMENTS, rejected before ANY request
+    {
+      const many: string[] = []
+      for (let i = 0; i < 11; i++) {
+        const p = join(root, `m${i}.txt`)
+        writeFileSync(p, 'x')
+        many.push(p)
+      }
+      const { calls, restore } = installFakeFetch(() => ({ status: 201, text: '' }))
+      try {
+        const res = await sendAttachment.execute('c', { paths: many }, undefined)
+        assert.equal(res.isError, true)
+        assert.match(res.content[0].text, /too many attachments/)
+        assert.doesNotMatch(res.content[0].text, /\(HTTP/)
+        assert.equal(calls.length, 0, 'the count cap is enforced before any upload request')
+      } finally {
+        restore()
+      }
+    }
+    assert.equal(turn.sentCount, 0, 'no client-side failure counts as a send')
+  } finally {
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('de_message_send_attachment threads the caller turn-abort signal into the upload request', async () => {
+  // The combineSignals change must keep the caller's turn-abort signal wired
+  // into the request (not XOR'd away by the per-request timeout). Drive it with
+  // a pre-aborted signal and a fetch that rejects when it sees an aborted
+  // signal: if the signal did NOT propagate, the request would proceed and
+  // finalize would run. (Every other attachment test passes `undefined`.)
+  const root = mkdtempSync(join(tmpdir(), 'genteam-attach-signal-'))
+  const f = join(root, 'f.txt')
+  writeFileSync(f, 'hi')
+  const state = fakeConnection({ cfg: { ...fakeConnection().cfg, attachmentRoots: [root] } })
+  const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-1', turn)
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch((_url: string, init: any) => {
+    // Faithful stand-in for fetch honouring an aborted signal.
+    if (init?.signal?.aborted) throw new Error('The operation was aborted')
+    return { status: 201, text: '' }
+  })
+  try {
+    const aborted = new AbortController()
+    aborted.abort()
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const sendAttachment = tools.find((t: any) => t.name === 'de_message_send_attachment')
+    const res = await sendAttachment.execute('c', { paths: [f] }, aborted.signal)
+    assert.equal(res.isError, true, 'a pre-aborted caller signal must abort the upload')
+    assert.match(res.content[0].text, /^error: /)
+    assert.ok(
+      !calls.some((c) => c.url.endsWith('/attachment-session-finalize')),
+      'finalize must not run once the caller signal has aborted the request',
+    )
+    assert.equal(turn.sentCount, 0)
+  } finally {
+    restore()
+    connectionsByAccount.clear()
+    rmSync(root, { recursive: true, force: true })
   }
 })
 
