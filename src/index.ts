@@ -44,17 +44,24 @@ import { resolve, dirname, isAbsolute, relative } from 'path'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
-// TypeBox `Type` for the registerTool parameter schemas. The build only
-// transpiles (esbuild without --bundle), so this import is NOT inlined — it
-// resolves at runtime from the installed `typebox` (a hard dependency). v1's
+// TypeBox `Type` for the registerTool parameter schemas. esbuild `--bundle`
+// INLINES typebox into dist/index.js (only `ws` and the `openclaw` peer stay
+// external), so there is NO runtime `typebox` dependency for the gateway to
+// resolve. This is deliberate: a bare runtime `import 'typebox'` regressed in
+// the wild — the gateway installs plugin deps with `--omit=dev` and resolves
+// modules from the loaded extension path, so a typebox that is dev-only (or
+// installed to a different path) fails the WHOLE module load with "Cannot find
+// module 'typebox'". Bundling sidesteps both failure modes. typebox v1's
 // `Type.Object(...)` serializes to plain JSON Schema, which the gateway's own
-// typebox re-normalizes and validates, so there is no cross-version skew.
+// typebox re-normalizes and validates, so a bundled copy causes no
+// cross-version skew.
 import { Type } from 'typebox'
 
 // Shared GenTeam attachment session+SAS direct-upload core — the SAME module
-// the local/sandbox `de` CLI uses. It is a relative source import, so (unlike
-// `typebox`/`ws`) esbuild `--bundle` INLINES it into dist/index.js; there is no
-// runtime dependency on any sibling package.
+// the local/sandbox `de` CLI uses, kept in a sibling source dir outside this
+// package. It is a relative source import, so (like typebox) esbuild `--bundle`
+// INLINES it into dist/index.js; there is no runtime dependency on any sibling
+// package.
 import {
   uploadAttachmentsViaSession,
   combineSignals,
