@@ -63,7 +63,7 @@ import { createRequire } from 'module'
 import { Type } from 'typebox'
 
 // Shared GenTeam attachment session+SAS direct-upload core — the SAME module
-// the local/sandbox `de` CLI uses, kept in a sibling source dir outside this
+// the Local Computer daemon uses, kept in a sibling source dir outside this
 // package. It is a relative source import, so (like typebox) esbuild `--bundle`
 // INLINES it into dist/index.js; there is no runtime dependency on any sibling
 // package.
@@ -73,7 +73,7 @@ import {
   GENTEAM_ATTACHMENT_MAX_COUNT,
   GENTEAM_DIRECT_UPLOAD_MAX_BYTES,
   type AgentToolPost,
-} from '../shared/attachment-upload.ts'
+} from '../../shared/attachment-upload.ts'
 
 // Prefer the `ws` npm package over Node.js built-in WebSocket.
 // OpenClaw's gateway calls undici.setGlobalDispatcher() which corrupts the
@@ -725,6 +725,25 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       file_cursor: Type.Optional(Type.String({ description: 'Pagination cursor from a prior call.' })),
     }),
     buildBody: (p) => ({ target: p.target, ...(p.file_cursor ? { file_cursor: p.file_cursor } : {}) }),
+  },
+  {
+    name: 'de_share_project',
+    verb: 'share-project',
+    description:
+      'Share a Genspark project you created (via gsk create_task) with the current channel. Without `add`, lists who it is shared with; with `add` ("current" = every human member of the current channel, or comma-separated @handles) it grants those humans read access. Read-only, humans only — it never shares to an agent.',
+    parameters: Type.Object({
+      project_id: Type.String({ description: 'The id of the project to share.' }),
+      add: Type.Optional(
+        Type.String({
+          description:
+            '"current" to share with all human members of the current channel, or comma-separated @handles. Omit to just list current shares.',
+        }),
+      ),
+    }),
+    buildBody: (p) => ({
+      project_id: p.project_id,
+      ...(p.add ? { op: 'set', add: p.add } : { op: 'get' }),
+    }),
   },
   {
     name: 'de_message_read',

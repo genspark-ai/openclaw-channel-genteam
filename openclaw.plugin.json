@@ -11,6 +11,7 @@
       "de_server_info",
       "de_channel_members",
       "de_channel_files",
+      "de_share_project",
       "de_message_read",
       "de_thread_read",
       "de_thread_unfollow",

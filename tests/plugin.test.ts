@@ -150,7 +150,7 @@ test('register wires both a channel and the de tool surface', () => {
   plugin.register(api)
   assert.equal(channelRegistered, true)
   assert.equal(typeof toolFactory, 'function', 'registerTool must receive the factory')
-  assert.equal(DE_TOOL_NAMES.length, 17)
+  assert.equal(DE_TOOL_NAMES.length, 18)
 })
 
 // ---------------------------------------------------------------------------
