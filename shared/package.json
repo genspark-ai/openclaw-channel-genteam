@@ -1,0 +1,7 @@
+{
+  "name": "@genspark/genteam-shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared GenTeam agent-runtime source (bundled into @genspark/genteam-daemon and @genspark/genteam; not published on its own)."
+}

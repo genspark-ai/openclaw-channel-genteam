@@ -73,7 +73,7 @@ import {
   GENTEAM_ATTACHMENT_MAX_COUNT,
   GENTEAM_DIRECT_UPLOAD_MAX_BYTES,
   type AgentToolPost,
-} from '../../shared/attachment-upload.ts'
+} from '../shared/attachment-upload.ts'
 
 // Prefer the `ws` npm package over Node.js built-in WebSocket.
 // OpenClaw's gateway calls undici.setGlobalDispatcher() which corrupts the
@@ -749,16 +749,36 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_message_read',
     verb: 'message-read',
     description:
-      'Read recent message history for a channel/DM/thread target. The inbound turn ships no history by design — call this to see prior messages before replying.',
+      'Read message history for a channel/DM/thread target. The inbound turn ships no history by design — call this to see prior messages before replying. Use `before_message` / `around_message` (a comet_message_id, e.g. from a `de_message_search` hit) to load the page older than, or the window around, a specific message.',
     parameters: Type.Object({
       target: Type.String({ description: 'Channel/DM/thread target to read.' }),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: 'Max messages (default backend cap).' })),
+      before_message: Type.Optional(Type.String({ description: 'comet_message_id: load the page of messages older than this one.' })),
+      around_message: Type.Optional(Type.String({ description: 'comet_message_id: load the window around this message (the anchor row itself is excluded). Mutually exclusive with before_message.' })),
       before_cursor: Type.Optional(Type.String({ description: 'Pagination cursor for older messages.' })),
     }),
     buildBody: (p) => ({
       target: p.target,
       ...(p.limit != null ? { limit: p.limit } : {}),
+      ...(p.before_message ? { before_message: p.before_message } : {}),
+      ...(p.around_message ? { around_message: p.around_message } : {}),
       ...(p.before_cursor ? { before_cursor: p.before_cursor } : {}),
+    }),
+  },
+  {
+    name: 'de_message_search',
+    verb: 'message-search',
+    description:
+      'Full-text search of visible message history by keyword — use it to recover something discussed earlier that is no longer in context. Without `target` it searches every channel you are a member of; with `target` just that one. Returns relevance-ranked hits (a small default; pass `limit` up to 30 for more), each carrying a `target` + `comet_message_id`; chain `de_message_read` with `around_message`=<comet_message_id> to load the surrounding context.',
+    parameters: Type.Object({
+      query: Type.String({ description: 'Free-text keyword(s) to search for.' }),
+      target: Type.Optional(Type.String({ description: 'Restrict to one channel/DM/thread target; omit to search all your channels.' })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: 'Max hits (default 8, capped at 30).' })),
+    }),
+    buildBody: (p) => ({
+      query: p.query,
+      ...(p.target ? { target: p.target } : {}),
+      ...(p.limit != null ? { limit: p.limit } : {}),
     }),
   },
   {

@@ -13,6 +13,7 @@
       "de_channel_files",
       "de_share_project",
       "de_message_read",
+      "de_message_search",
       "de_thread_read",
       "de_thread_unfollow",
       "de_attachment_list",

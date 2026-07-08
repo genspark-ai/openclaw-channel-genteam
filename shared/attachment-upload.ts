@@ -1,16 +1,27 @@
-// GenTeam attachment session+SAS direct-upload core.
+// Shared GenTeam attachment session+SAS direct-upload core (issue #37432).
 //
 // ONE implementation of the 1 GiB direct-upload flow — per-file
 // ``attachment-session-init`` → streamed PUT to the Azure write SAS →
 // streaming sha256 → a SINGLE ``attachment-session-finalize`` that sends every
-// staged blob as ONE media message — reused by the `de` tool surfaces that
-// speak it (the local/sandbox `de` CLI and this OpenClaw channel plugin). It is
-// bundled (esbuild) into each package's own published artifact.
+// staged blob as ONE secure_media message — reused by BOTH TypeScript agent
+// runtimes that speak it:
+//
+//   * the Local Computer daemon `de` CLI (@genspark/genteam-daemon), and
+//   * the External OpenClaw channel plugin (@genspark/genteam).
+//
+// (The in-sandbox `de` shim is the third surface but is bash, generated into
+// backend/.../sandbox_lifecycle.py, so it can't import this module; it
+// implements the identical wire flow.)
+//
+// This module lives at toolkits/genteam/shared/ — OUTSIDE either package — so
+// neither package reaches into the other's source tree; each bundles this
+// source (esbuild) into its own published artifact.
 //
 // Transport is INJECTED via ``post`` so each caller supplies its own base URL +
-// auth (the plugin posts directly to the gateway-configured endpoint with the
-// agent token). The SAS PUT always goes DIRECTLY to Azure Blob (the body never
-// crosses the gateway / ingress), so it is done here with a plain ``fetch``.
+// auth (the daemon goes through its loopback credential proxy; the plugin posts
+// directly to the gateway-configured endpoint with the agent token). The SAS
+// PUT always goes DIRECTLY to Azure Blob (the body never crosses the proxy /
+// backend / ingress), so it is done here with a plain ``fetch``.
 //
 // Returns a DISCRIMINATED result rather than calling process.exit / throwing —
 // each caller maps it to its own surface (the CLI exits with a code + stderr
@@ -25,9 +36,11 @@ import { accessSync, constants as fsConstants, createReadStream, statSync } from
 import { basename } from "node:path";
 import { Readable } from "node:stream";
 
-// 1 GiB — mirrors the backend per-file/per-message byte cap.
+// 1 GiB — mirrors the backend ``GENTEAM_DIRECT_UPLOAD_MAX_BYTES``
+// (media_session.py). Drift-guarded by a daemon test.
 export const GENTEAM_DIRECT_UPLOAD_MAX_BYTES = 1_073_741_824;
-// Mirrors the backend per-message attachment count cap (=10).
+// Mirrors the backend ``MAX_SECURE_MEDIA_ATTACHMENTS_PER_MESSAGE`` (=10).
+// Drift-guarded by a daemon test.
 export const GENTEAM_ATTACHMENT_MAX_COUNT = 10;
 
 const DEFAULT_PUT_TIMEOUT_MS = 300_000; // 5 min — large blobs over slow links
@@ -152,7 +165,7 @@ export function combineSignals(
 
 /** SHA-256 of a file, streamed so a 1 GiB attachment never materialises in
  *  memory. Manifest idempotency hint only (the backend does NOT re-hash the
- *  staged blob — see the backend's trust model). */
+ *  staged blob — see ``build_outbound_descriptor_from_blob``'s trust model). */
 export function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash("sha256");
@@ -249,7 +262,7 @@ function parseSessionInit(body: string): SessionInit | null {
 }
 
 /** Upload N local files via the session+SAS direct-upload flow and send them as
- *  ONE media message (batch finalize). Pure of any process/exit concern:
+ *  ONE secure_media message (batch finalize). Pure of any process/exit concern:
  *  returns a discriminated result the caller maps to its own surface. */
 export async function uploadAttachmentsViaSession(
   params: AttachmentUploadParams,
@@ -417,7 +430,7 @@ export async function uploadAttachmentsViaSession(
     filesPayload.push({ upload_session: session.uploadSession, file_sha256: fileSha });
   }
 
-  // ---- Single batch finalize → ONE media message ----
+  // ---- Single batch finalize → ONE secure_media message ----
   const finalizePayload: Record<string, unknown> = { target, files: filesPayload };
   if (params.text) finalizePayload.text = params.text;
   if (params.idempotencyKey) finalizePayload.idempotency_key = params.idempotencyKey;

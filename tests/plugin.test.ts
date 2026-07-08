@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os'
 import {
   buildGenteamTools,
   DE_TOOL_NAMES,
+  DE_TOOL_DEFS,
   dispatchTurnToAgent,
   connectionsByAccount,
   plugin,
@@ -150,7 +151,7 @@ test('register wires both a channel and the de tool surface', () => {
   plugin.register(api)
   assert.equal(channelRegistered, true)
   assert.equal(typeof toolFactory, 'function', 'registerTool must receive the factory')
-  assert.equal(DE_TOOL_NAMES.length, 18)
+  assert.equal(DE_TOOL_NAMES.length, 19)
 })
 
 // ---------------------------------------------------------------------------
@@ -1214,4 +1215,52 @@ test('an abort during a dispatch that RESOLVES normally still emits turn.error, 
   } finally {
     restore()
   }
+})
+
+// ---------------------------------------------------------------------------
+// de_message_search + de_message_read history anchors (message-search feature)
+// ---------------------------------------------------------------------------
+
+test('every de tool name is declared in the manifest contracts.tools', () => {
+  // The registry rejects any registered tool name absent from the manifest,
+  // so DE_TOOL_NAMES must be a subset of contracts.tools — guards a new tool
+  // (de_message_search) added to DE_TOOL_DEFS but forgotten in the manifest.
+  const manifest = JSON.parse(
+    readFileSync(new URL('../openclaw.plugin.json', import.meta.url), 'utf8'),
+  )
+  const declared: string[] = manifest.contracts.tools
+  for (const name of DE_TOOL_NAMES) {
+    assert.ok(declared.includes(name), `${name} missing from openclaw.plugin.json contracts.tools`)
+  }
+  assert.ok(DE_TOOL_NAMES.includes('de_message_search'))
+})
+
+test('de_message_search forwards query/target/limit; optionals omitted', () => {
+  const search = DE_TOOL_DEFS.find((d) => d.name === 'de_message_search')
+  assert.ok(search, 'de_message_search tool def must exist')
+  assert.equal(search!.verb, 'message-search')
+  assert.deepEqual(search!.buildBody({ query: 'invoice', target: '#all', limit: 5 }, undefined), {
+    query: 'invoice',
+    target: '#all',
+    limit: 5,
+  })
+  assert.deepEqual(search!.buildBody({ query: 'x' }, undefined), { query: 'x' })
+})
+
+test('de_message_read forwards before_message/around_message, distinct from before_cursor', () => {
+  const read = DE_TOOL_DEFS.find((d) => d.name === 'de_message_read')
+  assert.ok(read, 'de_message_read tool def must exist')
+  assert.deepEqual(read!.buildBody({ target: '#all', before_message: '101' }, undefined), {
+    target: '#all',
+    before_message: '101',
+  })
+  assert.deepEqual(read!.buildBody({ target: '#all', around_message: '202' }, undefined), {
+    target: '#all',
+    around_message: '202',
+  })
+  // The pre-existing pagination cursor is a separate field and still works.
+  assert.deepEqual(read!.buildBody({ target: '#all', before_cursor: 'c1' }, undefined), {
+    target: '#all',
+    before_cursor: 'c1',
+  })
 })

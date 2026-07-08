@@ -7,8 +7,8 @@
 // module load throws. Two real regressions this guards:
 //
 //   1. The shared upload core is imported from a sibling source dir
-//      (../../shared/attachment-upload). esbuild `--bundle` must INLINE it; the
-//      old non-bundled command emitted a literal `from "../../shared/..."` that
+//      (../shared/attachment-upload). esbuild `--bundle` must INLINE it; the
+//      old non-bundled command emitted a literal `from "../shared/..."` that
 //      fails at runtime load — and no source-level (tsx) test catches it,
 //      because tsx resolves the .ts directly.
 //   2. `typebox` must be INLINED, not left as a bare `import 'typebox'`. When it
@@ -35,7 +35,7 @@ test('the bundled plugin loads with the shared upload core inlined', async () =>
   const dist = join(pkgRoot, 'dist', 'index.js')
   assert.ok(existsSync(dist), 'dist/index.js must exist after build')
 
-  // A dangling `../../shared/...` import throws here at module evaluation.
+  // A dangling `../shared/...` import throws here at module evaluation.
   const mod = await import(pathToFileURL(dist).href)
   assert.equal(typeof mod.plugin, 'object', 'plugin export must load')
   assert.equal(typeof mod.buildGenteamTools, 'function', 'buildGenteamTools export must load')
