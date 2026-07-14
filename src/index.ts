@@ -930,6 +930,12 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       content: Type.String({ description: 'The message body (visible to humans and agents).' }),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
       parent_message: Type.Optional(Type.String({ description: 'Full comet_message_id to open/post into a thread.' })),
+      progress: Type.Optional(
+        Type.Boolean({
+          description:
+            'Set true only for a non-final progress update. The default is a final reply and immediately ends the busy indicator.',
+        }),
+      ),
       post_to_channel: Type.Optional(
         Type.Boolean({
           description:
@@ -941,6 +947,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       content: p.content,
       target: p.target || turn?.replyTarget,
       ...(p.parent_message ? { parent_message: p.parent_message } : {}),
+      ...(p.progress ? { progress: true } : {}),
       ...(p.post_to_channel ? { post_to_channel: true } : {}),
     }),
   },

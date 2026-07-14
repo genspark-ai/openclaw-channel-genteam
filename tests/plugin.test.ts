@@ -207,7 +207,7 @@ test('a read tool POSTs verb + bearer to the right agent_tools endpoint', async 
   }
 })
 
-test('de_message_send (the reply tool) defaults target + forwards post_to_channel + counts the send', async () => {
+test('de_message_send defaults target + forwards progress/post_to_channel + counts the send', async () => {
   const state = fakeConnection()
   const turn = { turnId: 'turn-1', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
   state.turns.set('turn-1', turn)
@@ -217,11 +217,12 @@ test('de_message_send (the reply tool) defaults target + forwards post_to_channe
     const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
     const send = tools.find((t: any) => t.name === 'de_message_send')
     // post_to_channel escape hatch is forwarded.
-    await send.execute('call-2', { content: 'hello team', post_to_channel: true }, undefined)
+    await send.execute('call-2', { content: 'hello team', progress: true, post_to_channel: true }, undefined)
     assert.equal(calls[0].url, 'https://example.test/api/digital-employee/agent_tools/message-send')
     assert.equal(calls[0].body.verb, 'message-send')
     assert.equal(calls[0].body.content, 'hello team')
     assert.equal(calls[0].body.target, '#all', 'target defaults to the current turn reply_target')
+    assert.equal(calls[0].body.progress, true, 'progress forwarded')
     assert.equal(calls[0].body.post_to_channel, true, 'post_to_channel forwarded')
     assert.equal(turn.sentCount, 1, 'a successful send is counted')
   } finally {
