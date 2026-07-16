@@ -45,7 +45,7 @@ import { resolve, dirname, isAbsolute, relative, join } from 'path'
 import { tmpdir } from 'os'
 import { Readable, Transform } from 'stream'
 import { pipeline } from 'stream/promises'
-import { createHash, randomBytes } from 'crypto'
+import { createHash, randomBytes, randomUUID } from 'crypto'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
@@ -925,7 +925,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_message_send',
     verb: 'message-send',
     description:
-      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. `target` defaults to the current conversation when omitted; pass another channel/DM/thread for a proactive/cross-target send. Open a new thread with `parent_message`. Call it more than once to send multiple messages.',
+      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. `target` defaults to the current conversation when omitted; pass another channel/DM/thread for a proactive/cross-target send. Open a new thread with `parent_message`. Message bodies are capped at 8000 characters — split longer replies into multiple calls: set `progress: true` on every non-final chunk, number the chunks (e.g. "(part 2/5)") so no two are identical, and finish with exactly one ordinary final call without it; if the reply includes files, make the `de_message_send_attachment` call the single final send (caption via its `content`).',
     parameters: Type.Object({
       content: Type.String({ description: 'The message body (visible to humans and agents).' }),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
@@ -946,6 +946,9 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     buildBody: (p, turn) => ({
       content: p.content,
       target: p.target || turn?.replyTarget,
+      // Client-minted command identity (#42717 stage 5): one per send call,
+      // so the backend can collapse ad-hoc retries onto one manifest row.
+      operation_id: randomUUID(),
       ...(p.parent_message ? { parent_message: p.parent_message } : {}),
       ...(p.progress ? { progress: true } : {}),
       ...(p.post_to_channel ? { post_to_channel: true } : {}),

@@ -181,6 +181,23 @@ test('buildGenteamTools returns nothing when messageChannel is missing/empty (no
   assert.deepEqual(buildGenteamTools(undefined), [])
 })
 
+test('de_message_send description teaches the length cap + multipart progress rule', () => {
+  // A literal "call it more than once" split would end the busy state on
+  // chunk 1; the description must require progress on every non-final chunk
+  // and exactly one ordinary final call. Chunks must be numbered: identical
+  // progress bodies are deduped server-side and the duplicate never posts.
+  const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+  const send = tools.find((t: any) => t.name === 'de_message_send')
+  assert.ok(send.description.includes('capped at 8000 characters'))
+  assert.ok(send.description.includes('set `progress: true` on every non-final chunk'))
+  assert.ok(send.description.includes('number the chunks (e.g. "(part 2/5)") so no two are identical'))
+  assert.ok(send.description.includes('exactly one ordinary final call without it'))
+  // The attachment tool is always final — a reply with files must make that
+  // send the single final, not follow it with a second final text message.
+  assert.ok(send.description.includes('make the `de_message_send_attachment` call the single final send'))
+  assert.ok(send.description.includes('caption via its `content`'))
+})
+
 // ---------------------------------------------------------------------------
 // tool execute — verb in body + bearer + target default
 // ---------------------------------------------------------------------------
@@ -1264,4 +1281,40 @@ test('de_message_read forwards before_message/around_message, distinct from befo
     target: '#all',
     before_cursor: 'c1',
   })
+})
+
+// ---------------------------------------------------------------------------
+// #42717 stage 5 — de_message_send buildBody mints a per-call operation_id.
+// ---------------------------------------------------------------------------
+
+test('de_message_send buildBody emits a fresh operation_id per call', () => {
+  const send = DE_TOOL_DEFS.find((d) => d.name === 'de_message_send')
+  assert.ok(send, 'de_message_send tool def must exist')
+  const first = send!.buildBody({ content: 'hello', target: '#all' }, undefined)
+  const second = send!.buildBody({ content: 'hello', target: '#all' }, undefined)
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  assert.match(String(first.operation_id), uuidRe)
+  assert.match(String(second.operation_id), uuidRe)
+  // One mint per send CALL — a later send is a new operation.
+  assert.notEqual(first.operation_id, second.operation_id)
+})
+
+test('de_message_send forwards operation_id on the wire body', async () => {
+  const state = fakeConnection()
+  const turn = { turnId: 'turn-op', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-op', turn)
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch(() => ({ json: { status: 0, comet_message_id: 'm1' } }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const send = tools.find((t: any) => t.name === 'de_message_send')
+    await send.execute('call-op', { content: 'hello team' }, undefined)
+    assert.equal(calls[0].body.verb, 'message-send')
+    assert.match(
+      String(calls[0].body.operation_id),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    )
+  } finally {
+    restore()
+  }
 })
