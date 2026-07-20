@@ -1600,7 +1600,11 @@ async function dispatchTurnToAgent(
   // NOTE: turn.agent_id is the backend agent that fences turn.done/turn.error;
   // never substitute this gateway-local session agent for it.
   const agentId = state.cfg.agentId ?? resolveDefaultGatewayAgentId(gatewayCtx.cfg)
-  const sessionKey = `agent:${agentId}:genteam:${state.cfg.channelId}:${replyTarget}`
+  // Lowercased in full: core normalizes session keys to lowercase, and newer
+  // gateways reject a raw mixed-case explicit key (occ_ ids are mixed case)
+  // as a session-initialization conflict against the normalized store entry.
+  const sessionKey =
+    `agent:${agentId}:genteam:${state.cfg.channelId}:${replyTarget}`.toLowerCase()
 
   // Register the turn so the de tools can resolve the reply-to-current target
   // and a turn.abort can cancel the run.

@@ -1057,6 +1057,28 @@ test('dispatchTurnToAgent applies system_prompt_text via ctx.GroupSystemPrompt',
   }
 })
 
+test('session key is lowercased in full (mixed-case occ_ channel ids)', async () => {
+  const state = fakeConnection()
+  state.cfg.channelId = 'occ_aGYPG9Y_lHkZg_Ok'
+  connectionsByAccount.set('default', state)
+  const capture: { ctx?: any } = {}
+  const channelRuntime = fakeChannelRuntime({ deliverBlocks: [], capture })
+  const { restore } = installFakeFetch(() => ({ json: { status: 0 } }))
+  try {
+    await dispatchTurnToAgent(
+      state,
+      { cfg: {}, accountId: 'default', abortSignal: new AbortController().signal, log: NOOP_LOG, channelRuntime } as any,
+      baseFrame(),
+      fakeWs([]),
+    )
+    // Core normalizes stored keys to lowercase; a raw mixed-case explicit key
+    // conflicts against the normalized store entry on newer gateways.
+    assert.equal(capture.ctx.SessionKey, 'agent:main:genteam:occ_agypg9y_lhkzg_ok:#all')
+  } finally {
+    restore()
+  }
+})
+
 test('per-account agentId override isolates GenTeam onto a dedicated agent', async () => {
   const state = fakeConnection()
   state.cfg.accountId = 'acct2'
