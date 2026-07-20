@@ -59,3 +59,32 @@ The agent shows **Online** in GenTeam once the gateway connects. Message it in a
 channel and it runs the turn on your gateway and replies in place. Your agent gets
 GenTeam's actions — reading messages, posting replies, tasks, attachments — as built-in
 tools, no extra setup.
+
+## Which agent runs GenTeam turns
+
+By default GenTeam turns run on the gateway's **default agent** (usually `main`) —
+the same agent, workspace, and memory that serve your other channels, so the agent
+you already trained recognizes you and its context in GenTeam too. Sessions stay
+separate per GenTeam conversation, like any other channel.
+
+To isolate GenTeam onto a dedicated agent instead (its own workspace and memory),
+set an `agentId` on the account:
+
+```json
+"default": {
+  "endpoint": "…",
+  "channelId": "…",
+  "appToken": "…",
+  "botToken": "…",
+  "agentId": "genteam-worker"
+}
+```
+
+### Upgrading to 0.7.x
+
+Versions before 0.7.0 keyed GenTeam sessions to an auto-provisioned per-connection
+agent with a fresh, empty workspace. After upgrading, turns run on the default agent
+(above), so each GenTeam conversation starts a new session once — the agent can
+re-read channel history through its message tools. The old auto-provisioned agent's
+session and workspace directories are left in place and unused; delete them or keep
+them, either is harmless. Set `agentId` to restore the old isolation behavior.

@@ -980,7 +980,10 @@ test('a backend rejection surfaces as an error tool result', async () => {
 
 // A fake channelRuntime that captures the finalized ctx and drives the deliver
 // callback with the supplied reply blocks.
-function fakeChannelRuntime(opts: { deliverBlocks?: any[]; capture: { ctx?: any } }) {
+function fakeChannelRuntime(opts: {
+  deliverBlocks?: any[]
+  capture: { ctx?: any; storeAgentId?: string }
+}) {
   return {
     reply: {
       finalizeInboundContext(ctx: any) {
@@ -996,7 +999,8 @@ function fakeChannelRuntime(opts: { deliverBlocks?: any[]; capture: { ctx?: any 
       },
     },
     session: {
-      resolveStorePath() {
+      resolveStorePath(_store: any, storeOpts?: { agentId?: string }) {
+        opts.capture.storeAgentId = storeOpts?.agentId
         return '/tmp/store'
       },
       async recordInboundSession() {},
@@ -1028,7 +1032,7 @@ function baseFrame(overrides: Partial<TurnStartFrame> = {}): TurnStartFrame {
 test('dispatchTurnToAgent applies system_prompt_text via ctx.GroupSystemPrompt', async () => {
   const state = fakeConnection()
   connectionsByAccount.set('default', state)
-  const capture: { ctx?: any } = {}
+  const capture: { ctx?: any; storeAgentId?: string } = {}
   const channelRuntime = fakeChannelRuntime({ deliverBlocks: [], capture })
   const sent: any[] = []
   const { restore } = installFakeFetch(() => ({ json: { status: 0 } }))
@@ -1042,6 +1046,63 @@ test('dispatchTurnToAgent applies system_prompt_text via ctx.GroupSystemPrompt',
     assert.equal(capture.ctx.GroupSystemPrompt, 'YOU ARE HELPER. Reply via tools.', 'system_prompt_text → ctx.GroupSystemPrompt')
     assert.equal(capture.ctx.Provider, 'genteam')
     assert.equal(capture.ctx.ChatType, 'group')
+    assert.equal(
+      capture.ctx.SessionKey,
+      'agent:main:genteam:occ_test:#all',
+      'turns run on the gateway default agent (shared brain), keyed per (connection, target)',
+    )
+    assert.equal(capture.storeAgentId, 'main', 'session metadata recorded under the same agent')
+  } finally {
+    restore()
+  }
+})
+
+test('per-account agentId override isolates GenTeam onto a dedicated agent', async () => {
+  const state = fakeConnection()
+  state.cfg.accountId = 'acct2'
+  state.cfg.channelId = 'occ_acct2'
+  state.cfg.agentId = 'helper'
+  connectionsByAccount.set('acct2', state)
+  const capture: { ctx?: any; storeAgentId?: string } = {}
+  const channelRuntime = fakeChannelRuntime({ deliverBlocks: [], capture })
+  const { restore } = installFakeFetch(() => ({ json: { status: 0 } }))
+  try {
+    await dispatchTurnToAgent(
+      state,
+      { cfg: {}, accountId: 'acct2', abortSignal: new AbortController().signal, log: NOOP_LOG, channelRuntime } as any,
+      baseFrame(),
+      fakeWs([]),
+    )
+    assert.equal(capture.ctx.SessionKey, 'agent:helper:genteam:occ_acct2:#all')
+    assert.equal(capture.storeAgentId, 'helper')
+  } finally {
+    restore()
+  }
+})
+
+test('gateway default agent resolution honors agents.list (default flag, else first)', async () => {
+  const state = fakeConnection()
+  connectionsByAccount.set('default', state)
+  const capture: { ctx?: any } = {}
+  const channelRuntime = fakeChannelRuntime({ deliverBlocks: [], capture })
+  const { restore } = installFakeFetch(() => ({ json: { status: 0 } }))
+  try {
+    await dispatchTurnToAgent(
+      state,
+      {
+        cfg: { agents: { list: [{ id: 'other' }, { id: 'Alfred', default: true }] } },
+        accountId: 'default',
+        abortSignal: new AbortController().signal,
+        log: NOOP_LOG,
+        channelRuntime,
+      } as any,
+      baseFrame(),
+      fakeWs([]),
+    )
+    assert.ok(
+      String(capture.ctx.SessionKey).startsWith('agent:alfred:genteam:'),
+      `default-flagged agents.list entry wins (got ${capture.ctx.SessionKey})`,
+    )
   } finally {
     restore()
   }

@@ -173,6 +173,11 @@ interface GenteamAccountConfig {
   // Optional per-attachment download cap (bytes); defaults to 1 GiB. Lets an
   // operator restrict how large a single materialized download may be.
   attachmentDownloadMaxBytes?: number
+  // Gateway agent that runs GenTeam turns (session + workspace). Absent → the
+  // gateway's default agent ('main'): the WhatsApp-parity shared-brain
+  // behavior. Set a dedicated agent id to isolate GenTeam from the main
+  // workspace.
+  agentId?: string
 }
 
 interface AuthResult {
@@ -344,6 +349,12 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
     acc.attachmentDownloadMaxBytes > 0
       ? Math.floor(acc.attachmentDownloadMaxBytes)
       : undefined
+  // Lowercased to match core's agent-id normalization — a mixed-case value
+  // would make the session key and core's store/workspace resolution disagree.
+  const agentId =
+    typeof acc.agentId === 'string' && acc.agentId.trim().length > 0
+      ? acc.agentId.trim().toLowerCase()
+      : undefined
 
   const missing: string[] = []
   if (!endpoint) missing.push('endpoint')
@@ -365,11 +376,27 @@ function resolveAccount(cfg: any, accountId?: string | null): GenteamAccountConf
     attachmentRoots,
     attachmentDownloadDir,
     attachmentDownloadMaxBytes,
+    agentId,
   }
 }
 
 function listAccountIds(cfg: any): string[] {
   return Object.keys(cfg?.channels?.genteam?.accounts ?? {})
+}
+
+// Mirrors core resolveDefaultAgentId: the default-flagged (else first)
+// agents.list entry, else 'main'. A literal 'main' would auto-provision an
+// unconfigured agent (fresh workspace) on gateways whose default agent has a
+// different id — core parses the session key's agent segment with no
+// existence check.
+function resolveDefaultGatewayAgentId(cfg: any): string {
+  const list = Array.isArray(cfg?.agents?.list)
+    ? cfg.agents.list.filter((a: any) => a && typeof a === 'object')
+    : []
+  if (list.length === 0) return 'main'
+  const chosen = list.find((a: any) => a?.default) ?? list[0]
+  const id = typeof chosen?.id === 'string' ? chosen.id.trim().toLowerCase() : ''
+  return id || 'main'
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,8 +1592,15 @@ async function dispatchTurnToAgent(
     return
   }
 
-  const agentId = turn.agent_id || state.auth.agentId || 'main'
-  const sessionKey = `agent:${agentId}:genteam:${replyTarget}`
+  // Session agent: gateway default, overridable per account (see
+  // GenteamAccountConfig.agentId). channelId (unique per connection) keys the
+  // session so neither a second account nor REBINDING the same account to a
+  // different GenTeam agent can resume another binding's session — channel
+  // reply targets are bare slugs (`#all`) that collide across servers.
+  // NOTE: turn.agent_id is the backend agent that fences turn.done/turn.error;
+  // never substitute this gateway-local session agent for it.
+  const agentId = state.cfg.agentId ?? resolveDefaultGatewayAgentId(gatewayCtx.cfg)
+  const sessionKey = `agent:${agentId}:genteam:${state.cfg.channelId}:${replyTarget}`
 
   // Register the turn so the de tools can resolve the reply-to-current target
   // and a turn.abort can cancel the run.
@@ -1639,7 +1673,7 @@ async function dispatchTurnToAgent(
   }
 
   log?.info?.(
-    `[genteam] dispatching turn ${turn.turn_id} agent=${agentId} ` +
+    `[genteam] dispatching turn ${turn.turn_id} agent=${turn.agent_id} session_agent=${agentId} ` +
       `target=${replyTarget} envelope_len=${(turn.envelope || '').length} ` +
       `system_prompt=${turn.system_prompt_text ? 'applied' : 'none'}`,
   )
@@ -1691,7 +1725,7 @@ async function dispatchTurnToAgent(
     // finalizes the turn, but the silent case must be observable, not invisible).
     if (active.sentCount === 0) {
       log?.warn?.(
-        `[S] de_openclaw_turn_no_reply turn=${turn.turn_id} agent=${agentId} ` +
+        `[S] de_openclaw_turn_no_reply turn=${turn.turn_id} agent=${turn.agent_id} ` +
           `target=${replyTarget} — dispatch completed with no de_message_send`,
       )
     }

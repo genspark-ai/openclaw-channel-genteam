@@ -72,6 +72,10 @@
                   "type": "integer",
                   "description": "Maximum size (bytes) of a single attachment de_attachment_view will download. Defaults to 1 GiB.",
                   "minimum": 1
+                },
+                "agentId": {
+                  "type": "string",
+                  "description": "Gateway agent id that runs GenTeam turns (session + workspace). Default: the gateway's main agent, so GenTeam shares the agent's existing workspace/memory like any other channel. Set a dedicated agent id to isolate GenTeam from the main workspace."
                 }
               }
             }
