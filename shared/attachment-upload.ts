@@ -70,6 +70,8 @@ export interface AttachmentUploadParams {
   idempotencyKey?: string | null;
   parentMessage?: string | null;
   postToChannel?: boolean;
+  /** Cross-conversation dispatch (#46049) — rides the finalize ``dispatch`` field. */
+  dispatch?: boolean;
   post: AgentToolPost;
   signal?: AbortSignal;
   /** SAS PUT timeout (default 5 min). */
@@ -436,6 +438,7 @@ export async function uploadAttachmentsViaSession(
   if (params.idempotencyKey) finalizePayload.idempotency_key = params.idempotencyKey;
   if (params.parentMessage) finalizePayload.parent_message = params.parentMessage;
   if (params.postToChannel) finalizePayload.post_to_channel = true;
+  if (params.dispatch) finalizePayload.dispatch = true;
 
   let finResp: { status: number; body: string };
   try {

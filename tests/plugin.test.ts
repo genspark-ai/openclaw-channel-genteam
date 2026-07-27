@@ -31,6 +31,7 @@ import {
   DE_TOOL_DEFS,
   dispatchTurnToAgent,
   connectionsByAccount,
+  runGenteamMonitor,
   plugin,
   type ConnectionState,
   type TurnStartFrame,
@@ -1400,4 +1401,47 @@ test('de_message_send forwards operation_id on the wire body', async () => {
   } finally {
     restore()
   }
+})
+
+// ---------------------------------------------------------------------------
+// runGenteamMonitor — auth-exchange failure disposition
+// ---------------------------------------------------------------------------
+
+test('monitor treats auth-exchange HTTP 401 as fatal but retries other failures', async () => {
+  const cfg = fakeConnection().cfg
+  const authBody = (detail: string) => new TextEncoder().encode(JSON.stringify({ detail }))
+  const gatewayCtx = (abortSignal: AbortSignal) => ({
+    cfg: {},
+    accountId: cfg.accountId,
+    abortSignal,
+    log: NOOP_LOG,
+    channelRuntime: {},
+  })
+
+  // 401 (token revoked / connection deleted) → fatal after ONE attempt. The
+  // watchdog abort only fires on regression (infinite retry) to fail fast.
+  const fatalAbort = new AbortController()
+  const watchdog = setTimeout(() => fatalAbort.abort(), 10_000)
+  const fatal = installFakeFetch(() => ({ status: 401, bodyBytes: authBody('bot token rejected') }))
+  try {
+    await runGenteamMonitor(cfg, gatewayCtx(fatalAbort.signal))
+  } finally {
+    fatal.restore()
+    clearTimeout(watchdog)
+  }
+  assert.equal(fatalAbort.signal.aborted, false)
+  assert.equal(fatal.calls.length, 1)
+
+  // Non-401 failure stays transient: a second attempt happens, then we abort.
+  const transientAbort = new AbortController()
+  const transient = installFakeFetch(() => {
+    if (transient.calls.length >= 2) transientAbort.abort()
+    return { status: 503, bodyBytes: authBody('upstream unavailable') }
+  })
+  try {
+    await runGenteamMonitor(cfg, gatewayCtx(transientAbort.signal))
+  } finally {
+    transient.restore()
+  }
+  assert.ok(transient.calls.length >= 2)
 })

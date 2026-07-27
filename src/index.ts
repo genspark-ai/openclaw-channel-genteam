@@ -403,6 +403,16 @@ function resolveDefaultGatewayAgentId(cfg: any): string {
 // (1) Auth-exchange — botToken → ws_token + agent_token + routing
 // ---------------------------------------------------------------------------
 
+class AuthExchangeError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+  ) {
+    super(message)
+    this.name = 'AuthExchangeError'
+  }
+}
+
 async function authExchange(cfg: GenteamAccountConfig): Promise<AuthResult> {
   const url = `${cfg.endpoint}/api/digital-employee/openclaw/channel/auth`
   const res = await fetch(url, {
@@ -427,7 +437,7 @@ async function authExchange(cfg: GenteamAccountConfig): Promise<AuthResult> {
 
   if (json?.status !== 0) {
     const detail = json?.error || json?.message || JSON.stringify(json)
-    throw new Error(`[genteam] auth-exchange failed (HTTP ${res.status}): ${detail}`)
+    throw new AuthExchangeError(`[genteam] auth-exchange failed (HTTP ${res.status}): ${detail}`, res.status)
   }
 
   const d = json.data ?? {}
@@ -952,7 +962,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_message_send',
     verb: 'message-send',
     description:
-      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. `target` defaults to the current conversation when omitted; pass another channel/DM/thread for a proactive/cross-target send. Open a new thread with `parent_message`. Message bodies are capped at 8000 characters — split longer replies into multiple calls: set `progress: true` on every non-final chunk, number the chunks (e.g. "(part 2/5)") so no two are identical, and finish with exactly one ordinary final call without it; if the reply includes files, make the `de_message_send_attachment` call the single final send (caption via its `content`).',
+      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. `target` defaults to the current conversation when omitted; during a turn, sends go to the turn\'s own conversation — to deliver to a DIFFERENT channel/DM/thread your creator asked for, also set `dispatch: true`. Open a new thread with `parent_message`. Message bodies are capped at 8000 characters — split longer replies into multiple calls: set `progress: true` on every non-final chunk, number the chunks (e.g. "(part 2/5)") so no two are identical, and finish with exactly one ordinary final call without it; if the reply includes files, make the `de_message_send_attachment` call the single final send (caption via its `content`).',
     parameters: Type.Object({
       content: Type.String({ description: 'The message body (visible to humans and agents).' }),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
@@ -969,6 +979,12 @@ const DE_TOOL_DEFS: DeToolDef[] = [
             "Set true to reply to the task's ORIGIN channel instead of its thread. Only use after a send was rejected with `task_reply_requires_thread` and you deliberately want the origin channel.",
         }),
       ),
+      dispatch: Type.Optional(
+        Type.Boolean({
+          description:
+            'Set true to deliver to a conversation OTHER than the current turn\'s own (creator-started turns only). The send does NOT end your turn — still send your normal final reply afterwards.',
+        }),
+      ),
     }),
     buildBody: (p, turn) => ({
       content: p.content,
@@ -979,6 +995,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       ...(p.parent_message ? { parent_message: p.parent_message } : {}),
       ...(p.progress ? { progress: true } : {}),
       ...(p.post_to_channel ? { post_to_channel: true } : {}),
+      ...(p.dispatch ? { dispatch: true } : {}),
     }),
   },
 ]
@@ -1111,6 +1128,12 @@ function buildGenteamTools(toolCtx: any): any[] {
       content: Type.Optional(Type.String({ description: 'Optional caption.' })),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
       parent_message: Type.Optional(Type.String({ description: 'Open/post into a thread.' })),
+      dispatch: Type.Optional(
+        Type.Boolean({
+          description:
+            'Set true to deliver to a conversation OTHER than the current turn\'s own (creator-started turns only). The send does NOT end your turn.',
+        }),
+      ),
     }),
     execute: async (
       _toolCallId: string,
@@ -1166,6 +1189,7 @@ function buildGenteamTools(toolCtx: any): any[] {
           target,
           text: params?.content != null ? String(params.content) : null,
           parentMessage: params?.parent_message != null ? String(params.parent_message) : null,
+          dispatch: params?.dispatch === true,
           post,
           signal,
           putTimeoutMs: TOOL_ATTACHMENT_HTTP_TIMEOUT_MS,
@@ -1815,6 +1839,13 @@ async function runGenteamMonitor(cfg: GenteamAccountConfig, gatewayCtx: GatewayC
         break
       }
     } catch (e) {
+      // An auth-exchange HTTP 401 is the HTTP-stage twin of WS close 4401: a
+      // deterministic credential rejection — retrying would loop 401s forever.
+      if (e instanceof AuthExchangeError && e.httpStatus === 401) {
+        log?.error?.('[genteam] fatal auth-exchange 401 — stopping monitor (re-create the connection in GenTeam)')
+        reportDisconnected()
+        break
+      }
       log?.error?.(`[genteam] monitor error: ${e}`)
       reportDisconnected()
     }
@@ -1942,6 +1973,8 @@ export {
   resolveAccount,
   listAccountIds,
   classifyClose,
+  runGenteamMonitor,
+  AuthExchangeError,
   plugin,
 }
 export type { ConnectionState, ActiveTurn, TurnStartFrame, GenteamAccountConfig, AuthResult }
