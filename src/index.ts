@@ -767,7 +767,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_share_project',
     verb: 'share-project',
     description:
-      'Share a Genspark project you created (via gsk create_task) with the current channel. Without `add`, lists who it is shared with; with `add` ("current" = every human member of the current channel, or comma-separated @handles) it grants those humans read access. Read-only, humans only — it never shares to an agent.',
+      'Share a Genspark project you created (via gsk create_task) with the current channel. Without `add`, lists who it is shared with; with `add` ("current" = every human member of the current channel, or comma-separated @handles) it grants those humans access — `permission` "read" (default, view only) or "write" (co-edit; a write grant also lets their own agents edit the project via gsk). Write works only for collaboration-capable project types (slides/docs/sheets/code/...); read-only types (deep research, podcasts, ...) reject write, so share those read. Humans only — it never shares to an agent.',
     parameters: Type.Object({
       project_id: Type.String({ description: 'The id of the project to share.' }),
       add: Type.Optional(
@@ -776,10 +776,16 @@ const DE_TOOL_DEFS: DeToolDef[] = [
             '"current" to share with all human members of the current channel, or comma-separated @handles. Omit to just list current shares.',
         }),
       ),
+      permission: Type.Optional(
+        Type.Union([Type.Literal('read'), Type.Literal('write')], {
+          description: 'Grant level when adding: "read" (default) or "write" (co-edit).',
+        }),
+      ),
     }),
     buildBody: (p) => ({
       project_id: p.project_id,
       ...(p.add ? { op: 'set', add: p.add } : { op: 'get' }),
+      ...(p.add && p.permission ? { permission: p.permission } : {}),
     }),
   },
   {
