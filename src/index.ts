@@ -39,14 +39,21 @@
  *   (2) channel WS:     {ws_base}/api/digital-employee/openclaw/channel/ws?token=<ws_token>
  *   (3) write-back:     POST {endpoint}/api/digital-employee/agent_tools/<verb>
  */
-import { readFileSync, realpathSync, createWriteStream, mkdirSync, lstatSync, mkdtempSync } from 'fs'
+import {
+  readFileSync,
+  realpathSync,
+  createWriteStream,
+  mkdirSync,
+  lstatSync,
+  mkdtempSync,
+  existsSync,
+} from 'fs'
 import { rm } from 'fs/promises'
-import { resolve, dirname, isAbsolute, relative, join } from 'path'
+import { resolve, dirname, isAbsolute, relative, join, delimiter } from 'path'
 import { tmpdir } from 'os'
 import { Readable, Transform } from 'stream'
 import { pipeline } from 'stream/promises'
 import { createHash, randomBytes, randomUUID } from 'crypto'
-import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 // TypeBox `Type` for the registerTool parameter schemas. esbuild `--bundle`
@@ -95,11 +102,20 @@ import {
 // only defers to the explicit warn below.
 let WsWebSocket: typeof WebSocket =
   typeof WebSocket !== 'undefined' ? WebSocket : (undefined as unknown as typeof WebSocket)
+// Pure-fs equivalent of `readlink -f $(which openclaw)`: walk PATH for the
+// gateway binary and resolve its symlink chain to the real install location.
+// Deliberately no child_process — a shell exec in a published plugin trips
+// registry security scanners (and is simply unnecessary here).
+const resolvedOpenclawBinPath = (): string => {
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue
+    const candidate = join(dir, 'openclaw')
+    if (existsSync(candidate)) return realpathSync(candidate)
+  }
+  throw new Error('openclaw not found on PATH')
+}
 let _wsResolved = false
-for (const resolveFrom of [
-  () => import.meta.url,
-  () => execSync('readlink -f $(which openclaw)', { encoding: 'utf-8' }).trim(),
-]) {
+for (const resolveFrom of [() => import.meta.url, resolvedOpenclawBinPath]) {
   try {
     WsWebSocket = createRequire(resolveFrom())('ws')
     _wsResolved = true
