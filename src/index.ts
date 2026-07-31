@@ -231,9 +231,10 @@ interface ActiveTurn {
   replyTarget: string
   parentMessage?: string
   abort: AbortController
-  // Count of successful visible sends (de_message_send / -attachment) this turn.
-  // Used only to observe the no-reply case (a turn that posts nothing); NOT a
-  // delivery fallback.
+  // Count of successful visible channel writes this turn (de_message_send /
+  // -attachment, plus message edit/delete/forward). Used only to observe the
+  // no-reply case (a turn that changes nothing visible); NOT a delivery
+  // fallback.
   sentCount: number
 }
 
@@ -749,7 +750,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     description:
       'List the members (humans and agents) of a GenTeam channel or DM. `target` is a channel like "#all" or a dm target.',
     parameters: Type.Object({
-      target: Type.String({ description: 'Channel/DM target, e.g. "#all" or "dm:@alice".' }),
+      target: Type.String({ description: 'Channel/DM target, e.g. "#all" or "@dm:<channel_id>".' }),
     }),
     buildBody: (p) => ({ target: p.target }),
   },
@@ -968,7 +969,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_message_send',
     verb: 'message-send',
     description:
-      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. `target` defaults to the current conversation when omitted; during a turn, sends go to the turn\'s own conversation — to deliver to a DIFFERENT channel/DM/thread your creator asked for, also set `dispatch: true`. Open a new thread with `parent_message`. Message bodies are capped at 8000 characters — split longer replies into multiple calls: set `progress: true` on every non-final chunk, number the chunks (e.g. "(part 2/5)") so no two are identical, and finish with exactly one ordinary final call without it; if the reply includes files, make the `de_message_send_attachment` call the single final send (caption via its `content`).',
+      'Send a visible GenTeam message. THIS IS HOW YOU REPLY — your assistant text is never shown to anyone, so you MUST call this tool to say anything visible. Open a new thread with `parent_message`. Message bodies are capped at 8000 characters — split longer replies into multiple calls: set `progress: true` on every non-final chunk, number the chunks (e.g. "(part 2/5)") so no two are identical, and finish with exactly one ordinary final call without it; if the reply includes files, make the `de_message_send_attachment` call the single final send (caption via its `content`).',
     parameters: Type.Object({
       content: Type.String({ description: 'The message body (visible to humans and agents).' }),
       target: Type.Optional(Type.String({ description: 'Where to post; defaults to the current conversation.' })),
@@ -1004,7 +1005,81 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       ...(p.dispatch ? { dispatch: true } : {}),
     }),
   },
+  {
+    name: 'de_message_edit',
+    verb: 'message-edit',
+    description:
+      'Edit YOUR OWN earlier message when its content would now mislead a reader. Own messages only. Silent: nobody is re-notified except newly ADDED @mentions. Never use edit to continue a conversation — send a new message.',
+    parameters: Type.Object({
+      message_id: Type.String({ description: 'comet_message_id of your own message to edit.' }),
+      content: Type.String({ description: 'The full replacement message body.' }),
+      target: Type.Optional(
+        Type.String({ description: 'Conversation the message is in; defaults to the current conversation.' }),
+      ),
+    }),
+    buildBody: (p) => ({
+      message_id: p.message_id,
+      content: p.content,
+      // Client-minted command identity, one per call (same as de_message_send).
+      operation_id: randomUUID(),
+      ...(p.target ? { target: p.target } : {}),
+    }),
+  },
+  {
+    name: 'de_message_delete',
+    verb: 'message-delete',
+    description:
+      'Delete YOUR OWN message. Immediate and irreversible; use only when an edit cannot fix a message that would mislead readers.',
+    parameters: Type.Object({
+      message_id: Type.String({ description: 'comet_message_id of your own message to delete.' }),
+      target: Type.Optional(
+        Type.String({ description: 'Conversation the message is in; defaults to the current conversation.' }),
+      ),
+    }),
+    buildBody: (p) => ({
+      message_id: p.message_id,
+      operation_id: randomUUID(),
+      ...(p.target ? { target: p.target } : {}),
+    }),
+  },
+  {
+    name: 'de_message_forward',
+    verb: 'message-forward',
+    description:
+      "Forward 1-5 messages from a conversation you can read to up to 5 channels or DMs you are a member of, as one snapshot card with an optional note (the note's @mentions notify). Never forward DM or private-channel content to a different audience unless the people in that conversation asked or it is plainly meant to be shared.",
+    parameters: Type.Object({
+      message_ids: Type.Array(Type.String(), {
+        minItems: 1,
+        maxItems: 5,
+        description: 'comet_message_ids of the messages to forward (1-5, all from the source conversation).',
+      }),
+      to: Type.Array(Type.String(), {
+        minItems: 1,
+        maxItems: 5,
+        description: 'Destination channel/DM targets (1-5), e.g. "#all" or "@dm:<channel_id>".',
+      }),
+      note: Type.Optional(
+        Type.String({ description: "Optional note posted with the forwarded card; the note's @mentions notify." }),
+      ),
+      target: Type.Optional(
+        Type.String({ description: 'Source conversation the messages are in; defaults to the current conversation.' }),
+      ),
+    }),
+    // The wire field for the note is `content` (same field a plain send uses).
+    buildBody: (p) => ({
+      message_ids: p.message_ids,
+      to: p.to,
+      operation_id: randomUUID(),
+      ...(p.note ? { content: p.note } : {}),
+      ...(p.target ? { target: p.target } : {}),
+    }),
+  },
 ]
+
+// Verbs whose success is a visible channel write. Counted toward the turn's
+// sentCount so a turn that only edits / deletes / forwards is not misread as a
+// silent no-reply turn.
+const VISIBLE_SEND_VERBS = new Set(['message-send', 'message-edit', 'message-delete', 'message-forward'])
 
 // Build the per-turn `de` tool list for a tool factory invocation. Scoped to
 // genteam turns; resolves the live ConnectionState by account at execute time
@@ -1057,7 +1132,7 @@ function buildGenteamTools(toolCtx: any): any[] {
       }
       try {
         const res = await callAgentTool(state, def.verb, body, signal)
-        if (def.verb === 'message-send' && res.ok && turn) turn.sentCount += 1
+        if (VISIBLE_SEND_VERBS.has(def.verb) && res.ok && turn) turn.sentCount += 1
         return toolResultFromCall(res)
       } catch (e: any) {
         return toolText(`error: ${String(e?.message ?? e)}`, true)
@@ -1128,7 +1203,7 @@ function buildGenteamTools(toolCtx: any): any[] {
     name: 'de_message_send_attachment',
     label: 'de_message_send_attachment',
     description:
-      'Send one or more local files as a GenTeam message attachment (up to 10, 1 GiB each). `paths` must be absolute paths under configured attachment roots; if no roots are configured, local uploads are disabled. Optional `content` is the caption. `target` defaults to the current conversation.',
+      'Send one or more local files as a GenTeam message attachment (up to 10, 1 GiB each). `paths` must be absolute paths under configured attachment roots; if no roots are configured, local uploads are disabled. Optional `content` is the caption. Target / parent_message / dispatch semantics match `de_message_send`.',
     parameters: Type.Object({
       paths: Type.Array(Type.String(), { minItems: 1, maxItems: GENTEAM_ATTACHMENT_MAX_COUNT, description: 'Local file paths to upload.' }),
       content: Type.Optional(Type.String({ description: 'Optional caption.' })),
@@ -1136,8 +1211,7 @@ function buildGenteamTools(toolCtx: any): any[] {
       parent_message: Type.Optional(Type.String({ description: 'Open/post into a thread.' })),
       dispatch: Type.Optional(
         Type.Boolean({
-          description:
-            'Set true to deliver to a conversation OTHER than the current turn\'s own (creator-started turns only). The send does NOT end your turn.',
+          description: 'Same semantics as `de_message_send` dispatch.',
         }),
       ),
     }),
@@ -1754,13 +1828,14 @@ async function dispatchTurnToAgent(
       return
     }
     // Parity with local/sandbox: the agent's visible reply is de_message_send,
-    // not its native text. If a turn completes without any send tool firing, no
-    // message reached the channel — log it (the backend's no-send handling still
-    // finalizes the turn, but the silent case must be observable, not invisible).
+    // not its native text. If a turn completes without any visible channel
+    // write (send/attachment/edit/delete/forward), nothing reached the channel
+    // — log it (the backend's no-send handling still finalizes the turn, but
+    // the silent case must be observable, not invisible).
     if (active.sentCount === 0) {
       log?.warn?.(
         `[S] de_openclaw_turn_no_reply turn=${turn.turn_id} agent=${turn.agent_id} ` +
-          `target=${replyTarget} — dispatch completed with no de_message_send`,
+          `target=${replyTarget} — dispatch completed with no visible send`,
       )
     }
     log?.info?.(`[genteam] turn ${turn.turn_id} dispatch completed (sends=${active.sentCount})`)

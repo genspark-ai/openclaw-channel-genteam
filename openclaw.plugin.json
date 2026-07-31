@@ -26,6 +26,9 @@
       "de_reaction_add",
       "de_reaction_remove",
       "de_message_send",
+      "de_message_edit",
+      "de_message_delete",
+      "de_message_forward",
       "de_message_send_attachment"
     ]
   },

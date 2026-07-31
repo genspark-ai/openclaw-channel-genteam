@@ -152,7 +152,7 @@ test('register wires both a channel and the de tool surface', () => {
   plugin.register(api)
   assert.equal(channelRegistered, true)
   assert.equal(typeof toolFactory, 'function', 'registerTool must receive the factory')
-  assert.equal(DE_TOOL_NAMES.length, 19)
+  assert.equal(DE_TOOL_NAMES.length, 22)
 })
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1334,9 @@ test('every de tool name is declared in the manifest contracts.tools', () => {
   for (const name of DE_TOOL_NAMES) {
     assert.ok(declared.includes(name), `${name} missing from openclaw.plugin.json contracts.tools`)
   }
-  assert.ok(DE_TOOL_NAMES.includes('de_message_search'))
+  for (const name of ['de_message_search', 'de_message_edit', 'de_message_delete', 'de_message_forward']) {
+    assert.ok(DE_TOOL_NAMES.includes(name), `${name} missing from DE_TOOL_NAMES`)
+  }
 })
 
 test('de_message_search forwards query/target/limit; optionals omitted', () => {
@@ -1398,6 +1400,118 @@ test('de_message_send forwards operation_id on the wire body', async () => {
       String(calls[0].body.operation_id),
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     )
+  } finally {
+    restore()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// message mutation tools — de_message_edit / de_message_delete /
+// de_message_forward (buildBody shape, note→content mapping, array bounds,
+// sentCount accounting)
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+test('de_message_edit buildBody: message_id/content + fresh operation_id, target only when given', () => {
+  const edit = DE_TOOL_DEFS.find((d) => d.name === 'de_message_edit')
+  assert.ok(edit, 'de_message_edit tool def must exist')
+  assert.equal(edit!.verb, 'message-edit')
+  const body = edit!.buildBody({ message_id: 'm1', content: 'corrected' }, undefined)
+  assert.equal(body.message_id, 'm1')
+  assert.equal(body.content, 'corrected')
+  assert.match(String(body.operation_id), UUID_RE)
+  assert.ok(!('target' in body), 'target omitted when not supplied (backend defaults it)')
+  const withTarget = edit!.buildBody({ message_id: 'm1', content: 'corrected', target: '#all' }, undefined)
+  assert.equal(withTarget.target, '#all')
+  // One mint per call — a model-decided retry is a new operation.
+  const again = edit!.buildBody({ message_id: 'm1', content: 'corrected' }, undefined)
+  assert.notEqual(body.operation_id, again.operation_id)
+})
+
+test('de_message_delete buildBody: message_id + fresh operation_id, target only when given', () => {
+  const del = DE_TOOL_DEFS.find((d) => d.name === 'de_message_delete')
+  assert.ok(del, 'de_message_delete tool def must exist')
+  assert.equal(del!.verb, 'message-delete')
+  const body = del!.buildBody({ message_id: 'm2' }, undefined)
+  assert.equal(body.message_id, 'm2')
+  assert.match(String(body.operation_id), UUID_RE)
+  assert.ok(!('target' in body))
+  const withTarget = del!.buildBody({ message_id: 'm2', target: 'dm:@alice' }, undefined)
+  assert.equal(withTarget.target, 'dm:@alice')
+})
+
+test('de_message_forward buildBody maps note→content and forwards message_ids/to', () => {
+  const fwd = DE_TOOL_DEFS.find((d) => d.name === 'de_message_forward')
+  assert.ok(fwd, 'de_message_forward tool def must exist')
+  assert.equal(fwd!.verb, 'message-forward')
+  const body = fwd!.buildBody(
+    { message_ids: ['m1', 'm2'], to: ['#all', 'dm:@alice'], note: 'for visibility', target: '#dev' },
+    undefined,
+  )
+  assert.deepEqual(body.message_ids, ['m1', 'm2'])
+  assert.deepEqual(body.to, ['#all', 'dm:@alice'])
+  assert.equal(body.content, 'for visibility', 'note maps to the wire `content` field')
+  assert.ok(!('note' in body), 'the wire body carries content, never note')
+  assert.equal(body.target, '#dev', 'explicit source conversation is forwarded')
+  assert.match(String(body.operation_id), UUID_RE)
+  // No note / no target → both fields omitted (backend defaults the source).
+  const bare = fwd!.buildBody({ message_ids: ['m1'], to: ['#all'] }, undefined)
+  assert.ok(!('content' in bare))
+  assert.ok(!('target' in bare))
+})
+
+test('de_message_forward schema bounds message_ids and to to 1..5', () => {
+  const fwd = DE_TOOL_DEFS.find((d) => d.name === 'de_message_forward')!
+  const schema: any = fwd.parameters
+  assert.equal(schema.properties.message_ids.minItems, 1)
+  assert.equal(schema.properties.message_ids.maxItems, 5)
+  assert.equal(schema.properties.to.minItems, 1)
+  assert.equal(schema.properties.to.maxItems, 5)
+})
+
+test('successful edit/delete/forward calls count toward the turn sentCount', async () => {
+  // A mutation-only turn (no de_message_send) must not be misread as a silent
+  // no-reply turn — each successful mutation counts like a send.
+  const state = fakeConnection()
+  const turn = { turnId: 'turn-mut', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-mut', turn)
+  connectionsByAccount.set('default', state)
+  const { calls, restore } = installFakeFetch(() => ({ json: { status: 0 } }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const byName = (n: string) => tools.find((t: any) => t.name === n)
+    await byName('de_message_edit').execute('c1', { message_id: 'm1', content: 'corrected' }, undefined)
+    await byName('de_message_delete').execute('c2', { message_id: 'm1' }, undefined)
+    await byName('de_message_forward').execute('c3', { message_ids: ['m2'], to: ['#dev'] }, undefined)
+    assert.equal(calls.length, 3)
+    assert.equal(calls[0].url, 'https://example.test/api/digital-employee/agent_tools/message-edit')
+    assert.equal(calls[0].body.verb, 'message-edit')
+    assert.equal(calls[1].body.verb, 'message-delete')
+    assert.equal(calls[2].body.verb, 'message-forward')
+    assert.equal(turn.sentCount, 3, 'each successful mutation counts as a visible send')
+  } finally {
+    restore()
+  }
+})
+
+test('a rejected mutation does not count toward sentCount', async () => {
+  const state = fakeConnection()
+  const turn = { turnId: 'turn-mut2', replyTarget: '#all', abort: new AbortController(), sentCount: 0 }
+  state.turns.set('turn-mut2', turn)
+  connectionsByAccount.set('default', state)
+  // Backend GK-off shape: a structured {ok:false, code, message} rejection.
+  const { restore } = installFakeFetch(() => ({
+    status: 403,
+    json: { ok: false, code: 'TOOL_NOT_ENABLED', message: 'message edit is not enabled yet' },
+  }))
+  try {
+    const tools = buildGenteamTools({ messageChannel: 'genteam', agentAccountId: 'default' })
+    const edit = tools.find((t: any) => t.name === 'de_message_edit')
+    const res = await edit.execute('c4', { message_id: 'm1', content: 'corrected' }, undefined)
+    assert.equal(res.isError, true)
+    assert.ok(res.content[0].text.includes('TOOL_NOT_ENABLED') || res.content[0].text.includes('not enabled'))
+    assert.equal(turn.sentCount, 0, 'a rejected mutation is not a visible send')
   } finally {
     restore()
   }
