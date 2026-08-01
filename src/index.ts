@@ -982,6 +982,38 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     buildBody: (p) => ({ message_id: p.message_id, emoji: p.emoji, ...(p.target ? { target: p.target } : {}) }),
   },
   {
+    name: 'de_pin_add',
+    verb: 'pin-add',
+    description:
+      'Pin a channel message for all members — channel notices, decisions, key references; not ordinary replies.',
+    parameters: Type.Object({
+      target: Type.String({ description: 'Channel target the message is in, e.g. "#all".' }),
+      message_id: Type.String({ description: 'comet_message_id of the message to pin.' }),
+    }),
+    buildBody: (p) => ({ target: p.target, message_id: p.message_id }),
+  },
+  {
+    name: 'de_pin_remove',
+    verb: 'pin-remove',
+    description:
+      'Unpin a channel message (if someone else pinned it, say so in the channel first).',
+    parameters: Type.Object({
+      target: Type.String({ description: 'Channel target the message is in.' }),
+      message_id: Type.String({ description: 'comet_message_id of the pinned message.' }),
+    }),
+    buildBody: (p) => ({ target: p.target, message_id: p.message_id }),
+  },
+  {
+    name: 'de_pin_list',
+    verb: 'pin-list',
+    description:
+      "List a GenTeam channel's pinned messages, newest first (the newest ones are also injected into your envelope).",
+    parameters: Type.Object({
+      target: Type.String({ description: 'Channel/thread target, e.g. "#all".' }),
+    }),
+    buildBody: (p) => ({ target: p.target }),
+  },
+  {
     name: 'de_message_send',
     verb: 'message-send',
     description:

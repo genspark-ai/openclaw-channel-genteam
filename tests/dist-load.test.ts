@@ -40,8 +40,8 @@ test('the bundled plugin loads with the shared upload core inlined', async () =>
   assert.equal(typeof mod.plugin, 'object', 'plugin export must load')
   assert.equal(typeof mod.buildGenteamTools, 'function', 'buildGenteamTools export must load')
   assert.ok(
-    Array.isArray(mod.DE_TOOL_NAMES) && mod.DE_TOOL_NAMES.length === 22,
-    `the bundled artifact must carry all 22 de tools (got ${mod.DE_TOOL_NAMES?.length})`,
+    Array.isArray(mod.DE_TOOL_NAMES) && mod.DE_TOOL_NAMES.length === 25,
+    `the bundled artifact must carry all 25 de tools (got ${mod.DE_TOOL_NAMES?.length})`,
   )
 })
 
