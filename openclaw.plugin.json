@@ -32,6 +32,9 @@
       "de_message_edit",
       "de_message_delete",
       "de_message_forward",
+      "de_saved_list",
+      "de_saved_add",
+      "de_saved_remove",
       "de_message_send_attachment"
     ]
   },

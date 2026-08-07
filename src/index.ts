@@ -784,13 +784,13 @@ const DE_TOOL_DEFS: DeToolDef[] = [
     name: 'de_share_project',
     verb: 'share-project',
     description:
-      'Share a Genspark project you created (via gsk create_task) with the current channel. Without `add`, lists who it is shared with; with `add` ("current" = every human member of the current channel, or comma-separated @handles) it grants those humans access — `permission` "read" (default, view only) or "write" (co-edit; a write grant also lets their own agents edit the project via gsk). Write works only for collaboration-capable project types (slides/docs/sheets/code/...); read-only types (deep research, podcasts, ...) reject write, so share those read. Humans only — it never shares to an agent.',
+      'Share a Genspark project you created (via gsk create_task) with the current channel. Without `add`, lists who it is shared with; with `add` ("current" = every human member of the current channel, or comma-separated actor_ids / `@[name](actor_id)` mention tokens — display @handles are never matched) it grants those humans access — `permission` "read" (default, view only) or "write" (co-edit; a write grant also lets their own agents edit the project via gsk). Write works only for collaboration-capable project types (slides/docs/sheets/code/...); read-only types (deep research, podcasts, ...) reject write, so share those read. Humans only — it never shares to an agent.',
     parameters: Type.Object({
       project_id: Type.String({ description: 'The id of the project to share.' }),
       add: Type.Optional(
         Type.String({
           description:
-            '"current" to share with all human members of the current channel, or comma-separated @handles. Omit to just list current shares.',
+            '"current" to share with all human members of the current channel, or comma-separated actor_ids / `@[name](actor_id)` mention tokens (copy from de_channel_members; display @handles are never matched). Omit to just list current shares.',
         }),
       ),
       permission: Type.Optional(
@@ -814,7 +814,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       target: Type.String({ description: 'Channel/DM/thread target to read.' }),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: 'Max messages (default backend cap).' })),
       before_message: Type.Optional(Type.String({ description: 'comet_message_id: load the page of messages older than this one.' })),
-      around_message: Type.Optional(Type.String({ description: 'comet_message_id: load the window around this message (the anchor row itself is excluded). Mutually exclusive with before_message.' })),
+      around_message: Type.Optional(Type.String({ description: 'comet_message_id: load the window around this message, including the anchor message itself (use it to fetch the full text behind a truncated preview). Mutually exclusive with before_message.' })),
       before_cursor: Type.Optional(Type.String({ description: 'Pagination cursor for older messages.' })),
     }),
     buildBody: (p) => ({
@@ -844,9 +844,9 @@ const DE_TOOL_DEFS: DeToolDef[] = [
   {
     name: 'de_thread_read',
     verb: 'thread-read',
-    description: 'Read messages in a GenTeam thread. `thread` is a thread target (channel:shortId).',
+    description: 'Read messages in a GenTeam thread. `thread` is the thread channel id (starts with `ch_`) from your envelope target or tool output.',
     parameters: Type.Object({
-      thread: Type.String({ description: 'Thread target, e.g. "#all:1a2b3c4d".' }),
+      thread: Type.String({ description: 'Thread channel id, e.g. "ch_1a2b3c4d..." (never a #channel:shortId display form).' }),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
     }),
     buildBody: (p) => ({ thread: p.thread, ...(p.limit != null ? { limit: p.limit } : {}) }),
@@ -854,7 +854,7 @@ const DE_TOOL_DEFS: DeToolDef[] = [
   {
     name: 'de_thread_unfollow',
     verb: 'thread-unfollow',
-    description: 'Stop following a GenTeam thread so its replies no longer wake this agent.',
+    description: 'Stop ordinary thread_follow deliveries from a GenTeam thread. Direct @mentions of you in the thread still reach you and re-follow it.',
     parameters: Type.Object({
       thread: Type.String({ description: 'Thread target to unfollow.' }),
     }),
@@ -1121,6 +1121,41 @@ const DE_TOOL_DEFS: DeToolDef[] = [
       ...(p.note ? { content: p.note } : {}),
       ...(p.target ? { target: p.target } : {}),
     }),
+  },
+  // Saved Messages: the three verbs operate the CREATOR's private bookmark
+  // set and work only inside turns the creator initiated (backend-enforced;
+  // other turns get TOOL_OWNER_ONLY). No operation_id — the backend row id is
+  // deterministic per (owner, server, message), so retries are idempotent.
+  {
+    name: 'de_saved_list',
+    verb: 'saved-list',
+    description:
+      "List your creator's saved (bookmarked) messages, newest-first (index 1 = the most recently saved). Only works in a turn your creator initiated (their message triggered this turn). Each item's `preview` is truncated — before acting on a saved message, read the full text with de_message_read using the item's read_hint target as `target` plus around_message=<comet_message_id> (bookmarks can live in conversations other than the current one). Never repeat saved-list content where anyone other than your creator can read it, unless your creator explicitly asked.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: 'Max saved items to return (backend default/cap applies).' })),
+    }),
+    buildBody: (p) => ({ ...(p.limit != null ? { limit: p.limit } : {}) }),
+  },
+  {
+    name: 'de_saved_add',
+    verb: 'saved-add',
+    description:
+      "Save (bookmark) a message to your creator's private saved-messages list. Only works in a turn your creator initiated (their message triggered this turn), and only for messages in conversations your creator can access. `message_id` must be a real comet_message_id (from the turn envelope, de_message_read, or de_message_search).",
+    parameters: Type.Object({
+      target: Type.String({ description: 'Channel/DM/thread target the message is in, e.g. "#all" or "@dm:<channel_id>".' }),
+      message_id: Type.String({ description: 'comet_message_id of the message to save.' }),
+    }),
+    buildBody: (p) => ({ target: p.target, message_id: p.message_id }),
+  },
+  {
+    name: 'de_saved_remove',
+    verb: 'saved-remove',
+    description:
+      "Remove a message from your creator's saved-messages list by its comet_message_id (shown in de_saved_list output). Only works in a turn your creator initiated (their message triggered this turn). Removing an id that is not saved is a no-op.",
+    parameters: Type.Object({
+      message_id: Type.String({ description: 'comet_message_id of the saved message to remove.' }),
+    }),
+    buildBody: (p) => ({ message_id: p.message_id }),
   },
 ]
 
